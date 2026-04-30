@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Zoho Desk Dashboard Design System */
+@layer base {
+  :root {
+	  
+	font-size: 90%; /* Add this line */  
+    /* Core Background & Text - Pure White Background */
+    --background: 0 0% 100%;
+    --foreground: 0 0% 9%;
+
+    /* Card System - Clean White Cards */
+    --card: 0 0% 100%;
+    --card-foreground: 0 0% 9%;
+
+    /* Interactive Elements */
+    --popover: 0 0% 100%;
+    --popover-foreground: 0 0% 9%;
+
+    /* Zoho Brand Colors */
+    --primary: 214 100% 59%;
+    --primary-foreground: 0 0% 100%;
+    --primary-glow: 214 100% 69%;
+
+    /* Secondary System */
+    --secondary: 210 40% 96%;
+    --secondary-foreground: 0 0% 9%;
+
+    /* Utility Colors */
+    --muted: 210 40% 96%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 210 40% 96%;
+    --accent-foreground: 0 0% 9%;
+
+    /* Status Colors */
+    --success: 142 76% 36%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    /* Form Elements */
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 214 100% 59%;
+
+    --radius: 0.75rem;
+
+    /* Dashboard Gradients */
+    --gradient-primary: linear-gradient(135deg, hsl(214 100% 59%), hsl(214 100% 69%));
+    --gradient-success: linear-gradient(135deg, hsl(142 76% 36%), hsl(142 76% 46%));
+    --gradient-muted: linear-gradient(135deg, hsl(210 40% 96%), hsl(210 40% 98%));
+
+    /* Shadows */
+    --shadow-soft: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+    --shadow-medium: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+    --shadow-large: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+    --shadow-glow: 0 0 0 1px hsl(214 100% 59% / 0.1), 0 0 20px hsl(214 100% 59% / 0.2);
+
+    /* Animations */
+    --transition-fast: all 0.15s ease;
+    --transition-smooth: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  }
+
+  .dark {
+    --background: 15 23 42;
+    --foreground: 248 250 252;
+
+    --card: 30 41 59;
+    --card-foreground: 248 250 252;
+
+    --popover: 30 41 59;
+    --popover-foreground: 248 250 252;
+
+    --primary: 220 90% 56%;
+    --primary-foreground: 255 255 255;
+    --primary-glow: 220 90% 66%;
+
+    --secondary: 51 65 85;
+    --secondary-foreground: 248 250 252;
+
+    --muted: 51 65 85;
+    --muted-foreground: 148 163 184;
+
+    --accent: 51 65 85;
+    --accent-foreground: 147 197 253;
+
+    --success: 134 239 172;
+    --success-foreground: 22 101 52;
+    --warning: 251 191 36;
+    --warning-foreground: 146 64 14;
+    --destructive: 239 68 68;
+    --destructive-foreground: 255 255 255;
+
+    --border: 51 65 85;
+    --input: 51 65 85;
+    --ring: 220 90% 56%;
+
+    --gradient-primary: linear-gradient(135deg, hsl(var(--primary)), hsl(var(--primary-glow)));
+    --gradient-success: linear-gradient(135deg, hsl(134 239 172 / 0.2), hsl(134 239 182 / 0.3));
+    --gradient-muted: linear-gradient(135deg, hsl(var(--muted)), hsl(51 65 90));
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+@layer components {
+  .nav-menu-link {
+    @apply block select-none space-y-1 rounded-md p-3 leading-none no-underline outline-none transition-colors ring-offset-transparent focus-visible:ring-0;
+  }
+  .nav-menu-link:hover {
+    @apply bg-accent text-accent-foreground;
+  }
+  .nav-menu-link.active {
+    @apply bg-accent text-accent-foreground;
+  }
+}
