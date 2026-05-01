@@ -189,30 +189,22 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                         const currentJob = next[profileName];
                         if (!currentJob) return;
 
-                        if (currentJob.isPaused || (currentJob as any)._forcePaused) return;
-
                         let newResults = [...currentJob.results];
                         let newProcessed = currentJob.processedCount || 0;
                         let newSuccess = currentJob.successCount || 0;
                         let newError = currentJob.errorCount || 0;
 
                         grouped[profileName].forEach(result => {
-                            if (result.success === true) newSuccess++;
-                            else if (result.success === false) newError++;
-                            
-                            if (typeof result.success === 'boolean' || result.stage === 'complete') {
-                                newProcessed++;
+                            const existingIndex = newResults.findIndex(r => r.rowNumber === result.rowNumber);
+                            if (result.stage === 'complete') {
+                                if (existingIndex === -1 || newResults[existingIndex].stage !== 'complete') {
+                                    newProcessed++;
+                                    if (result.success) newSuccess++;
+                                    else newError++;
+                                }
                             }
-
-                            const existingIndex = newResults.findIndex(r => 
-                                (r.rowNumber !== undefined && r.rowNumber === result.rowNumber) ||
-                                (r.identifier && r.identifier === result.identifier)
-                            );
-                            
-                            const finalizedResult = { ...result, stage: 'complete' };
-
-                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...finalizedResult };
-                            else newResults.unshift(finalizedResult);
+                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...result };
+                            else newResults.unshift(result);
                         });
 
                         if (newResults.length > MAX_BUFFER_SIZE) {
@@ -251,7 +243,6 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         return () => clearInterval(heartbeat);
     }, [socket]); 
 
-    // 🚀 FIXED: Strips 'bil_' prefix and safely handles all database sync events
     useEffect(() => {
         if (!socket) return;
 
@@ -259,6 +250,31 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             setJobs(prev => {
                 const next = { ...prev };
                 let hasChanges = false;
+
+                Object.keys(next).forEach(profileName => {
+                    const memoryJob = next[profileName];
+                    if (memoryJob.isProcessing || memoryJob.results.length > 0 || memoryJob.totalToProcess > 0) {
+                        
+                        const profileConfig = billingProfiles.find(p => p.profileName === profileName);
+                        const actualModName = memoryJob.formData?.moduleApiName || profileConfig?.billing?.customModuleApiName;
+                        
+                        if (actualModName) {
+                            const expectedJobId = `bil_${actualModName}_${profileName}`;
+                            const existsInDb = allJobs.some(dbJob => 
+                                dbJob.id === expectedJobId || 
+                                (dbJob.profileName === profileName && dbJob.jobType === `bil_${actualModName}`)
+                            );
+                            if (!existsInDb) {
+                                next[profileName] = { 
+                                    ...memoryJob, results: [], totalToProcess: 0, isProcessing: false, 
+                                    isPaused: false, isComplete: false, processedCount: 0, successCount: 0, 
+                                    errorCount: 0, _forceStopped: true, _isQueued: false 
+                                } as any;
+                                hasChanges = true;
+                            }
+                        }
+                    }
+                });
 
                 allJobs.forEach(dbJob => {
                     if (!dbJob.jobType || !dbJob.jobType.startsWith('bil_')) return;
@@ -268,33 +284,24 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                     if (!profileName) return;
 
                     const existingJob = next[profileName] || createInitialJobState();
-                    const validModule = existingJob.formData?.moduleApiName;
+                    const profileConfig = billingProfiles.find(p => p.profileName === profileName);
+                    const validModule = existingJob.formData?.moduleApiName || profileConfig?.billing?.customModuleApiName || rawModule;
                     
                     if (validModule && rawModule === validModule) {
-                        
                         if ((existingJob as any)._isQueued) return; 
                         if (existingJob.isProcessing && (existingJob as any)._ignition === false) return; 
                         
-                        const newProcessed = Math.max(existingJob.processedCount || 0, dbJob.processedCount || dbJob.processedcount || 0);
-                        const newSuccess = Math.max(existingJob.successCount || 0, dbJob.successCount || dbJob.successcount || 0);
-                        const newError = Math.max(existingJob.errorCount || 0, dbJob.errorCount || dbJob.errorcount || 0);
-                        const newTotal = parseInt(dbJob.totalToProcess || dbJob.totaltoprocess || existingJob.totalToProcess || 0, 10);
+                        // 🚨 THE FIX: Force strict Number parsing to fix broken counters!
+                        const dbProcessed = parseInt(dbJob.processedCount || dbJob.processedcount || '0', 10);
+                        const dbSuccess = parseInt(dbJob.successCount || dbJob.successcount || '0', 10);
+                        const dbError = parseInt(dbJob.errorCount || dbJob.errorcount || '0', 10);
+                        const newTotal = parseInt(dbJob.totalToProcess || dbJob.totaltoprocess || existingJob.totalToProcess || '0', 10);
+
+                        const newProcessedSafe = Math.max(Number(existingJob.processedCount) || 0, dbProcessed);
+                        const newSuccessSafe = Math.max(Number(existingJob.successCount) || 0, dbSuccess);
+                        const newErrorSafe = Math.max(Number(existingJob.errorCount) || 0, dbError);
+
                         const dbStatus = dbJob.status || 'stopped';
-
-                        let newProcessedSafe = newProcessed;
-                        let newSuccessSafe = newSuccess;
-                        let newErrorSafe = newError;
-
-                        if (dbStatus === 'running' || dbStatus === 'paused') {
-                            newProcessedSafe = Math.max(newProcessed, dbProcessed);
-                            newSuccessSafe = Math.max(newSuccess, dbSuccess);
-                            newErrorSafe = Math.max(newError, dbError);
-                        } else {
-                            newProcessedSafe = dbProcessed;
-                            newSuccessSafe = dbSuccess;
-                            newErrorSafe = dbError;
-                        }
-                        
                         const isDone = newProcessedSafe >= newTotal && newTotal > 0;
                         
                         let backendIsProcessing = (dbStatus === 'running' || dbStatus === 'paused');
@@ -489,13 +496,10 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                         
                         if (!isNaN(startMs)) {
                             let calcTime = Math.floor((clientNow - startMs) / 1000);
-                            
-                            // Morocco Timezone jump correction
                             if (calcTime > 1800 && calcTime > ((job.processedCount || 0) * 15 + 120)) {
                                 const offsetSecs = new Date().getTimezoneOffset() * 60;
                                 calcTime += offsetSecs;
                             }
-                            
                             const finalTime = Math.max(0, calcTime);
                             
                             if (job.processingTime !== finalTime) {
@@ -561,7 +565,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                     const moduleApiName = currentJob.formData.moduleApiName || targetProfileObj?.billing?.customModuleApiName;
                     
                     if (moduleApiName && profileToUpdate) { 
-                        globalFieldsCache[`${profileToUpdate}_${moduleApiName}`] = fieldsReceived; 
+                        globalFieldsCache[`bil_${profileToUpdate}_${moduleApiName}`] = fieldsReceived; 
                     }
 
                     let newStaticData = { ...currentJob.formData.staticData };
@@ -582,7 +586,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             } else {
                 const failedModuleApiName = targetProfileObj?.billing?.customModuleApiName;
                 if (failedModuleApiName && profileToUpdate) {
-                    globalFieldsCache[`${profileToUpdate}_${failedModuleApiName}`] = []; 
+                    globalFieldsCache[`bil_${profileToUpdate}_${failedModuleApiName}`] = []; 
                 }
 
                 if (profileToUpdate === activeProfileName && !isStartingBatch) {
@@ -688,7 +692,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         if (fetchRef.current && !forceUpdate) return;
         fetchRef.current = true; 
 
-        const cacheKey = `${activeProfileName}_${moduleName}`;
+        const cacheKey = `bil_${activeProfileName}_${moduleName}`;
         if (forceUpdate) delete globalFieldsCache[cacheKey];
 
         setIsFetchingFields(true);
@@ -698,7 +702,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             setIsFetchingFields(prev => {
                 if (prev) {
                     toast({ title: "Fetch Timeout", description: "No response from server.", variant: "destructive" });
-                    globalFieldsCache[`${activeProfileName}_${moduleName}`] = []; 
+                    globalFieldsCache[`bil_${activeProfileName}_${moduleName}`] = []; 
                     fetchRef.current = false; 
                     return false;
                 }
@@ -713,7 +717,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
     const jobStateRaw = (activeProfileName && jobs[activeProfileName]) ? jobs[activeProfileName] : createInitialJobState();
     const jobState = { ...jobStateRaw, formData: { ...jobStateRaw.formData } };
     const expectedModule = selectedProfile?.billing?.customModuleApiName;
-    const cacheKey = activeProfileName && expectedModule ? `${activeProfileName}_${expectedModule}` : '';
+    const cacheKey = activeProfileName && expectedModule ? `bil_${activeProfileName}_${expectedModule}` : '';
     
     if (cacheKey && globalFieldsCache[cacheKey] && globalFieldsCache[cacheKey].length > 0) {
         if (!jobState.formData.availableFields || jobState.formData.availableFields.length === 0) {
@@ -735,7 +739,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             if (formData.moduleApiName !== moduleName) updateFormData({ moduleApiName: moduleName });
             
             const trueStateFields = jobs[activeProfileName]?.formData?.availableFields || [];
-            const currentCacheKey = `${activeProfileName}_${moduleName}`;
+            const currentCacheKey = `bil_${activeProfileName}_${moduleName}`;
             const cachedData = globalFieldsCache[currentCacheKey];
 
             if (cachedData !== undefined) {
@@ -835,7 +839,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                 
                 const targetModName = billingProfiles.find(p => p.profileName === profileName)?.billing?.customModuleApiName || formData.moduleApiName;
                 
-                const cacheKey = `${profileName}_${targetModName}`;
+                const cacheKey = `bil_${profileName}_${targetModName}`;
                 const targetFields = globalFieldsCache[cacheKey];
 
                 if (!targetFields) {
@@ -930,10 +934,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         billingProfiles.forEach(p => {
             const job = jobs[p.profileName];
             const modName = p.billing?.customModuleApiName;
-            
-            const isBillingJob = job?.formData?.moduleApiName;
-            
-            if (isBillingJob && modName && modName.trim() !== '' && modName.trim() !== 'cm_' && isBillingJob === modName) {
+            if (modName && modName.trim() !== '' && modName.trim() !== 'cm_' && job?.formData?.moduleApiName === modName) {
                 if (job.isProcessing && job.isPaused) paused++;
                 else if (job.isProcessing && !job.isPaused) running++;
                 else if ((job as any)._isQueued) queued++;
@@ -945,7 +946,8 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
     const handleMasterPauseAll = () => {
         const profilesToPause = billingProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && 
+            const modName = p.billing?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
                    ((job.isProcessing && !job.isPaused) || (job as any)._isQueued);
         });
 
@@ -969,7 +971,8 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         });
 
         profilesToPause.forEach(p => {
-            socket?.emit('pauseJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` }); 
+            const job = jobs[p.profileName];
+            socket?.emit('pauseJob', { profileName: p.profileName, jobType: `bil_${job.formData?.moduleApiName}` }); 
         });
         toast({ title: "Master Batch Paused", description: `Paused ${profilesToPause.length} accounts.` });
     };
@@ -977,7 +980,8 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
     const handleMasterForceResume = () => {
         const pausedProfiles = billingProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && 
+            const modName = p.billing?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
                    (job.isPaused || (job as any)._forcePaused);
         });
 
@@ -1001,7 +1005,8 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         });
 
         pausedProfiles.forEach(p => {
-            socket?.emit('resumeJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` }); 
+            const job = jobs[p.profileName];
+            socket?.emit('resumeJob', { profileName: p.profileName, jobType: `bil_${job.formData?.moduleApiName}` }); 
         });
         toast({ title: "Master Batch Resumed", description: `Resumed ${pausedProfiles.length} accounts.` });
     };
@@ -1009,11 +1014,14 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
     const handleMasterStopAll = () => {
         const activeProfiles = billingProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && (job.isProcessing || (job as any)._isQueued);
+            const modName = p.billing?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
+                   (job.isProcessing || (job as any)._isQueued);
         });
         
         activeProfiles.forEach(p => {
-            socket?.emit('endJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` });
+            const job = jobs[p.profileName];
+            socket?.emit('endJob', { profileName: p.profileName, jobType: `bil_${job.formData?.moduleApiName}` });
         });
 
         setJobs(prev => {
@@ -1042,7 +1050,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
 
         const missingFieldsProfiles = idleProfiles.filter(p => { 
             const profileModName = p.billing?.customModuleApiName;
-            const cacheKey = `${p.profileName}_${profileModName}`; 
+            const cacheKey = `bil_${p.profileName}_${profileModName}`; 
             return !globalFieldsCache[cacheKey] || globalFieldsCache[cacheKey].length === 0; 
         });
 
@@ -1053,7 +1061,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             return new Promise<void>((resolve) => {
                 const profileName = profileData.profileName;
                 const profileModName = profileData.billing?.customModuleApiName;
-                const cacheKey = `${profileName}_${profileModName}`;
+                const cacheKey = `bil_${profileName}_${profileModName}`;
 
                 const handleTempResult = (res: any) => {
                     const targetProfile = res.profileName || activeProfileName;
@@ -1081,7 +1089,7 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
         idleProfiles.forEach(profileData => {
             const profileName = profileData.profileName;
             const profileModName = profileData.billing?.customModuleApiName;
-            const cacheKey = `${profileName}_${profileModName}`;
+            const cacheKey = `bil_${profileName}_${profileModName}`;
             const targetFields = globalFieldsCache[cacheKey];
 
             if (!targetFields || targetFields.length === 0) {
@@ -1106,7 +1114,15 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                     safeStaticData = job.formData.staticData || {}; safeBulkField = job.formData.bulkField || ''; safeTargetHtmlField = (job.formData as any).targetHtmlField || '';
                 }
             } else {
-                return; 
+                finalBulkData = formData.bulkData;
+                if (formData.availableFields && formData.availableFields.length > 0 && targetFields && targetFields.length > 0) {
+                    const { mappedStatic, mappedBulk, mappedTargetHtml } = performSmartMapping(formData.availableFields, targetFields, formData.staticData, formData.bulkField, (formData as any).targetHtmlField || '');
+                    safeStaticData = mappedStatic; safeBulkField = mappedBulk; safeTargetHtmlField = mappedTargetHtml;
+                } else {
+                    safeStaticData = formData.staticData || {}; 
+                    safeBulkField = formData.bulkField || ''; 
+                    safeTargetHtmlField = (formData as any).targetHtmlField || '';
+                }
             }
 
             if (!safeBulkField) {
@@ -1143,7 +1159,9 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
                 const itemsToProcess = p.bulkData ? p.bulkData.split('\n').filter((x: string) => x.trim()).length : 0;
                 const existingJob = next[p.selectedProfileName] || createInitialJobState();
                 next[p.selectedProfileName] = {
-                    ...existingJob, isProcessing: false, isPaused: false, isComplete: false,
+                    ...existingJob, 
+                    formData: { ...existingJob.formData, moduleApiName: p.moduleApiName }, 
+                    isProcessing: false, isPaused: false, isComplete: false,
                     _forceStopped: false, _forcePaused: false, _isQueued: true, _ignition: false,
                     results: [], processingTime: 0, totalToProcess: itemsToProcess,
                     processedCount: 0, successCount: 0, errorCount: 0, processingStartTime: null 
@@ -1152,10 +1170,18 @@ const BillingCustomModule: React.FC<BillingCustomModuleProps> = ({
             return next;
         });
 
-        socket?.emit('startMasterBulkBillingCustomJob', {
-            moduleApiName: formData.moduleApiName,
-            concurrency: masterBatchConcurrency,
-            payloads: payloads
+        const payloadsByModule: Record<string, any[]> = {};
+        payloads.forEach(p => {
+            if (!payloadsByModule[p.moduleApiName]) payloadsByModule[p.moduleApiName] = [];
+            payloadsByModule[p.moduleApiName].push(p);
+        });
+
+        Object.keys(payloadsByModule).forEach(modName => {
+            socket?.emit('startMasterBulkBillingCustomJob', {
+                moduleApiName: modName,
+                concurrency: masterBatchConcurrency,
+                payloads: payloadsByModule[modName]
+            });
         });
         
         toast({ title: "Master Batch Running", description: `Sent ${payloads.length} accounts to the background server.` });

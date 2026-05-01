@@ -90,7 +90,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
     const inventoryProfiles = useMemo(() => {
         return profiles.filter(p => p.inventory?.orgId && p.inventory.orgId.trim() !== '');
-    }, [profiles]);   
+    }, [profiles]);
     
     useEffect(() => {
         if (activeProfileName) localStorage.setItem('inventoryCustomModuleActiveProfile', activeProfileName);
@@ -107,7 +107,13 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                     let hasChanges = false;
                     Object.keys(parsed).forEach(profileName => {
                         const existingJob = next[profileName] || createInitialJobState();
-                        next[profileName] = { ...existingJob, formData: { ...existingJob.formData, ...parsed[profileName] } };
+                        const savedData = parsed[profileName];
+                        next[profileName] = { 
+                            ...existingJob, 
+                            formData: { ...existingJob.formData, ...savedData },
+                            processingStartTime: savedData._savedStartTime ? new Date(savedData._savedStartTime) : existingJob.processingStartTime,
+                            processingTime: savedData._savedProcessingTime || existingJob.processingTime
+                        };
                         hasChanges = true;
                     });
                     return hasChanges ? next : prev;
@@ -121,7 +127,14 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             const formsToSave: Record<string, any> = {};
             let hasData = false;
             Object.keys(jobs).forEach(profileName => {
-                if (jobs[profileName]?.formData) { formsToSave[profileName] = jobs[profileName].formData; hasData = true; }
+                if (jobs[profileName]?.formData) { 
+                    formsToSave[profileName] = {
+                        ...jobs[profileName].formData,
+                        _savedStartTime: jobs[profileName].processingStartTime,
+                        _savedProcessingTime: jobs[profileName].processingTime
+                    }; 
+                    hasData = true; 
+                }
             });
             if (hasData) localStorage.setItem('inventoryCustomModuleForms_v1', JSON.stringify(formsToSave));
         } catch (error) {}
@@ -137,8 +150,8 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
     const selectedProfile = useMemo(() => {
         return inventoryProfiles.find(p => p.profileName === activeProfileName) || null;
-    }, [inventoryProfiles, activeProfileName]);
-    
+    }, [inventoryProfiles, activeProfileName]);  
+
     useEffect(() => {
         if (!socket || !activeProfileName) { setApiStatus({ status: 'loading', message: 'Waiting for profile...' }); return; }
         setApiStatus({ status: 'loading', message: 'Connecting to Zoho...' });
@@ -153,52 +166,27 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         return () => { socket.off('apiStatusResult', handleStatus); };
     }, [socket, activeProfileName]);
 
-    // 🚨 PERFECTLY MERGED INTERVAL: Handles both Timers and Socket Buffers flawlessly!
     useEffect(() => {
         const interval = setInterval(() => {
-            setJobs(prev => {
-                let next = { ...prev };
-                let changed = false;
-                const clientNow = Date.now();
+            if (resultBufferRef.current.length > 0) {
+                const resultsToProcess = [...resultBufferRef.current];
+                resultBufferRef.current = []; 
 
-                // 1. Process Timestamps seamlessly
-                Object.keys(next).forEach(profileName => {
-                    const job = next[profileName];
-                    if (job && job.isProcessing && !job.isPaused && job.processingStartTime) {
-                        const startMs = new Date(job.processingStartTime).getTime();
-                        
-                        if (!isNaN(startMs)) {
-                            let calcTime = Math.floor((clientNow - startMs) / 1000);
-                            if (calcTime > 1800 && calcTime > ((job.processedCount || 0) * 15 + 120)) {
-                                const offsetSecs = new Date().getTimezoneOffset() * 60;
-                                calcTime += offsetSecs;
-                            }
-                            const finalTime = Math.max(0, calcTime);
-                            
-                            if (job.processingTime !== finalTime) {
-                                next[profileName] = { ...job, processingTime: finalTime };
-                                changed = true;
-                            }
-                        }
-                    }
-                });
-
-                // 2. Process Incoming Results cleanly
-                if (resultBufferRef.current.length > 0) {
-                    const resultsToProcess = [...resultBufferRef.current];
-                    resultBufferRef.current = []; 
+                setJobs(prev => {
+                    let next = { ...prev };
+                    let changed = false;
 
                     const grouped: Record<string, any[]> = {};
                     resultsToProcess.forEach(r => {
-                        if (!grouped[r.profileName]) grouped[r.profileName] = [];
-                        grouped[r.profileName].push(r);
+                        const pName = r.profileName || activeProfileName;
+                        if (!pName) return;
+                        if (!grouped[pName]) grouped[pName] = [];
+                        grouped[pName].push(r);
                     });
 
                     Object.keys(grouped).forEach(profileName => {
                         const currentJob = next[profileName];
                         if (!currentJob) return;
-
-                        if (currentJob.isPaused || (currentJob as any)._forcePaused) return;
 
                         let newResults = [...currentJob.results];
                         let newProcessed = currentJob.processedCount || 0;
@@ -206,22 +194,16 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                         let newError = currentJob.errorCount || 0;
 
                         grouped[profileName].forEach(result => {
-                            if (result.success === true) newSuccess++;
-                            else if (result.success === false) newError++;
-                            
-                            if (typeof result.success === 'boolean' || result.stage === 'complete') {
-                                newProcessed++;
+                            const existingIndex = newResults.findIndex(r => r.rowNumber === result.rowNumber);
+                            if (result.stage === 'complete') {
+                                if (existingIndex === -1 || newResults[existingIndex].stage !== 'complete') {
+                                    newProcessed++;
+                                    if (result.success) newSuccess++;
+                                    else newError++;
+                                }
                             }
-
-                            const existingIndex = newResults.findIndex(r => 
-                                (r.rowNumber !== undefined && r.rowNumber === result.rowNumber) ||
-                                (r.identifier && r.identifier === result.identifier)
-                            );
-                            
-                            const finalizedResult = { ...result, stage: 'complete' };
-
-                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...finalizedResult };
-                            else newResults.unshift(finalizedResult);
+                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...result };
+                            else newResults.unshift(result);
                         });
 
                         if (newResults.length > MAX_BUFFER_SIZE) {
@@ -244,10 +226,10 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                         };
                         changed = true;
                     });
-                }
 
-                return changed ? next : prev;
-            });
+                    return changed ? next : prev;
+                });
+            }
         }, 1000); 
 
         return () => clearInterval(interval);
@@ -268,44 +250,66 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                 const next = { ...prev };
                 let hasChanges = false;
 
-                allJobs.forEach(dbJob => {
-                    // 🚀 FIX: Ignore jobs that aren't Billing jobs
-                    if (!dbJob.jobType || !dbJob.jobType.startsWith('bil_')) return;
-                    
-                    // 🚀 FIX: Strip the 'bil_' prefix so React recognizes it!
-                    const rawModule = dbJob.jobType.replace(/^bil_/, '');
-                    
-                    const existingJob = next[dbJob.profileName] || createInitialJobState();
-                    const validModule = existingJob.formData?.moduleApiName;
-                    
-                    // 🚀 FIX: Compare against the stripped rawModule
-                    if (validModule && rawModule === validModule) {
+                Object.keys(next).forEach(profileName => {
+                    const memoryJob = next[profileName];
+                    if (memoryJob.isProcessing || memoryJob.results.length > 0 || memoryJob.totalToProcess > 0) {
+                        const profileConfig = inventoryProfiles.find(p => p.profileName === profileName);
+                        const actualModName = memoryJob.formData?.moduleApiName || profileConfig?.inventory?.customModuleApiName;
                         
+                        if (actualModName) {
+                            const expectedJobId = `inv_${actualModName}_${profileName}`;
+                            const existsInDb = allJobs.some(dbJob => 
+                                dbJob.id === expectedJobId || 
+                                (dbJob.profileName === profileName && dbJob.jobType === `inv_${actualModName}`)
+                            );
+                            if (!existsInDb) {
+                                next[profileName] = { 
+                                    ...memoryJob, results: [], totalToProcess: 0, isProcessing: false, 
+                                    isPaused: false, isComplete: false, processedCount: 0, successCount: 0, 
+                                    errorCount: 0, _forceStopped: true, _isQueued: false 
+                                } as any;
+                                hasChanges = true;
+                            }
+                        }
+                    }
+                });
+
+                allJobs.forEach(dbJob => {
+                    if (!dbJob.jobType || !dbJob.jobType.startsWith('inv_')) return;
+                    
+                    const rawModule = dbJob.jobType.replace(/^inv_/, '');
+                    const profileName = dbJob.profileName || dbJob.profilename;
+                    if (!profileName) return;
+
+                    const existingJob = next[profileName] || createInitialJobState();
+                    const profileConfig = inventoryProfiles.find(p => p.profileName === profileName);
+                    const validModule = existingJob.formData?.moduleApiName || profileConfig?.inventory?.customModuleApiName || rawModule;
+                    
+                    if (validModule && rawModule === validModule) {
                         if ((existingJob as any)._isQueued) return; 
                         if (existingJob.isProcessing && (existingJob as any)._ignition === false) return; 
                         
-                        const newProcessed = Math.max(existingJob.processedCount || 0, dbJob.processedCount || 0);
-                        const newSuccess = Math.max(existingJob.successCount || 0, dbJob.successCount || 0);
-                        const newError = Math.max(existingJob.errorCount || 0, dbJob.errorCount || 0);
-                        const newTotal = dbJob.totalToProcess || existingJob.totalToProcess || 0;
+                        // 🚨 THE FIX: Force strict Number parsing to fix broken counters!
+                        const dbProcessed = parseInt(dbJob.processedCount || dbJob.processedcount || '0', 10);
+                        const dbSuccess = parseInt(dbJob.successCount || dbJob.successcount || '0', 10);
+                        const dbError = parseInt(dbJob.errorCount || dbJob.errorcount || '0', 10);
+                        const newTotal = parseInt(dbJob.totalToProcess || dbJob.totaltoprocess || existingJob.totalToProcess || '0', 10);
                         
-                        const isDone = newProcessed >= newTotal && newTotal > 0;
+                        const newProcessedSafe = Math.max(Number(existingJob.processedCount) || 0, dbProcessed);
+                        const newSuccessSafe = Math.max(Number(existingJob.successCount) || 0, dbSuccess);
+                        const newErrorSafe = Math.max(Number(existingJob.errorCount) || 0, dbError);
                         
-                        let backendIsProcessing = false;
-                        let backendIsPaused = false;
-                        let backendIsQueued = false;
+                        const dbStatus = dbJob.status || 'stopped';
+                        const isDone = newProcessedSafe >= newTotal && newTotal > 0;
+                        
+                        let backendIsProcessing = (dbStatus === 'running' || dbStatus === 'paused');
+                        let backendIsPaused = (dbStatus === 'paused' || dbStatus === 'paused_queued');
+                        let backendIsQueued = (dbStatus === 'queued' || dbStatus === 'paused_queued');
 
-                        if (!isDone) {
-                            if (dbJob.status === 'running') backendIsProcessing = true;
-                            else if (dbJob.status === 'paused') { backendIsProcessing = true; backendIsPaused = true; }
-                            else if (dbJob.status === 'queued') backendIsQueued = true;
-                            else if (dbJob.status === 'paused_queued') { backendIsQueued = true; backendIsPaused = true; }
-                        }
-
-                        if ((existingJob as any)._forceStopped) {
+                        if (isDone || (existingJob as any)._forceStopped) {
                             backendIsProcessing = false;
                             backendIsPaused = false;
-                        } else if ((existingJob as any)._forcePaused && !isDone && dbJob.status !== 'queued' && dbJob.status !== 'paused_queued') {
+                        } else if ((existingJob as any)._forcePaused && !isDone && !backendIsQueued) {
                             backendIsPaused = true;
                             backendIsProcessing = true;
                         }
@@ -325,14 +329,22 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                             mergedResults = mergedResults.slice(0, MAX_BUFFER_SIZE);
                         }
 
+                        let finalProcessingStartTime = dbJob.processingstarttime ? new Date(dbJob.processingstarttime) : existingJob.processingStartTime;
+                        let processingTime = existingJob.processingTime || 0;
+
+                        if (processingTime === 0 && newProcessedSafe > 0 && backendIsProcessing) {
+                            processingTime = Math.floor(newProcessedSafe * ((existingJob.formData?.delay || 0) + 1.5));
+                        }
+
                         if (
-                            existingJob.processedCount !== newProcessed ||
+                            existingJob.processedCount !== newProcessedSafe ||
                             existingJob.totalToProcess !== newTotal ||
                             existingJob.isProcessing !== backendIsProcessing ||
                             existingJob.isPaused !== backendIsPaused ||
+                            existingJob.formData?.moduleApiName !== validModule ||
                             JSON.stringify(existingJob.results?.slice(0, 3)) !== JSON.stringify(mergedResults.slice(0, 3))
                         ) {
-                            next[dbJob.profileName] = {
+                            next[profileName] = {
                                 ...existingJob,
                                 formData: { ...existingJob.formData, moduleApiName: validModule },
                                 isProcessing: backendIsProcessing,
@@ -342,9 +354,11 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                                 _forceStopped: isDone, 
                                 totalToProcess: newTotal,
                                 results: mergedResults,
-                                processedCount: newProcessed,
-                                successCount: newSuccess,
-                                errorCount: newError
+                                processedCount: newProcessedSafe,
+                                successCount: newSuccessSafe,
+                                errorCount: newErrorSafe,
+                                processingStartTime: finalProcessingStartTime,
+                                processingTime: processingTime
                             };
                             hasChanges = true;
                         }
@@ -355,88 +369,58 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             setIsDbSynced(true);
         };
 
-        const handleBufferedResult = (result: any) => {
-            resultBufferRef.current.push(result);
-        };
+        const handleBufferedResult = (result: any) => { resultBufferRef.current.push(result); };
 
-        // 🚀 FIX: Strip 'bil_' prefix from all live socket events too!
         const handleJobStarted = (data: any) => {
-            if (!data.jobType?.startsWith('bil_')) return;
-            const rawModule = data.jobType.replace(/^bil_/, '');
+            if (!data.jobType?.startsWith('inv_')) return;
+            const rawModule = data.jobType.replace(/^inv_/, '');
             setJobs(prev => {
-                const profileJob = prev[data.profileName];
-                if (profileJob && (profileJob.formData.moduleApiName === rawModule)) {
-                    return { 
-                        ...prev, 
-                        [data.profileName]: { 
-                            ...profileJob, 
-                            _isQueued: false, 
-                            isProcessing: true,
-                            processingStartTime: new Date()
-                        } as any 
-                    };
-                }
-                return prev;
+                const profileJob = prev[data.profileName] || createInitialJobState();
+                return { ...prev, [data.profileName]: { ...profileJob, formData: { ...profileJob.formData, moduleApiName: rawModule }, _isQueued: false, isProcessing: true, processingStartTime: new Date() } as any };
             });
         };
 
         const handleJobPaused = (data: any) => {
-            if (!data.jobType?.startsWith('bil_')) return;
-            const rawModule = data.jobType.replace(/^bil_/, '');
+            if (!data.jobType?.startsWith('inv_')) return;
+            const rawModule = data.jobType.replace(/^inv_/, '');
             setJobs(prev => {
-                const profileJob = prev[data.profileName];
-                if (profileJob && (profileJob.formData.moduleApiName === rawModule)) {
-                    const isQueued = !!(profileJob as any)._isQueued;
-                    return { ...prev, [data.profileName]: { ...profileJob, isPaused: true, isProcessing: !isQueued } };
-                }
-                return prev;
+                const profileJob = prev[data.profileName] || createInitialJobState();
+                const isQueued = !!(profileJob as any)._isQueued;
+                return { ...prev, [data.profileName]: { ...profileJob, formData: { ...profileJob.formData, moduleApiName: rawModule }, isPaused: true, isProcessing: !isQueued } };
             });
         };
 
         const handleJobResumed = (data: any) => {
-            if (!data.jobType?.startsWith('bil_')) return;
-            const rawModule = data.jobType.replace(/^bil_/, '');
+            if (!data.jobType?.startsWith('inv_')) return;
+            const rawModule = data.jobType.replace(/^inv_/, '');
             setJobs(prev => {
-                const profileJob = prev[data.profileName];
-                if (profileJob && (profileJob.formData.moduleApiName === rawModule)) {
-                    const isQueued = !!(profileJob as any)._isQueued;
-                    return { ...prev, [data.profileName]: { ...profileJob, isPaused: false, isProcessing: !isQueued } };
-                }
-                return prev;
+                const profileJob = prev[data.profileName] || createInitialJobState();
+                const isQueued = !!(profileJob as any)._isQueued;
+                return { ...prev, [data.profileName]: { ...profileJob, formData: { ...profileJob.formData, moduleApiName: rawModule }, isPaused: false, isProcessing: !isQueued } };
             });
         };
 
         const handleBulkEnded = (data: any) => {
-            if (!data.jobType?.startsWith('bil_')) return;
-            const rawModule = data.jobType.replace(/^bil_/, '');
+            if (!data.jobType?.startsWith('inv_')) return;
+            const rawModule = data.jobType.replace(/^inv_/, '');
             setJobs(prev => {
-                const profileJob = prev[data.profileName];
-                if (profileJob && (profileJob.formData.moduleApiName === rawModule)) {
-                    return { ...prev, [data.profileName]: { ...profileJob, isProcessing: false, isPaused: false, isComplete: true, _forceStopped: true, _isQueued: false } as any };
-                }
-                return prev;
+                const profileJob = prev[data.profileName] || createInitialJobState();
+                return { ...prev, [data.profileName]: { ...profileJob, formData: { ...profileJob.formData, moduleApiName: rawModule }, isProcessing: false, isPaused: false, isComplete: true, _forceStopped: true, _isQueued: false } as any };
             });
         };
 
         const handleJobCleared = (data: any) => {
-            if (!data.jobType?.startsWith('bil_')) return;
-            const rawModule = data.jobType.replace(/^bil_/, '');
+            if (!data.jobType?.startsWith('inv_')) return;
+            const rawModule = data.jobType.replace(/^inv_/, '');
             setJobs(prev => {
-                const profileJob = prev[data.profileName];
-                if (profileJob && (profileJob.formData.moduleApiName === rawModule)) {
-                    return { 
-                        ...prev, [data.profileName]: { 
-                            ...profileJob, results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, processedCount: 0, successCount: 0, errorCount: 0, formData: { ...profileJob.formData, bulkData: '' }, _forceStopped: true, _isQueued: false 
-                        } as any
-                    };
-                }
-                return prev;
+                const profileJob = prev[data.profileName] || createInitialJobState();
+                return { ...prev, [data.profileName]: { ...profileJob, formData: { ...profileJob.formData, moduleApiName: rawModule, bulkData: '' }, results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, processedCount: 0, successCount: 0, errorCount: 0, _forceStopped: true, _isQueued: false } as any };
             });
             toast({ title: "Database Wiped", description: `All data cleared for ${data.profileName}` });
         };
 
         socket.on('databaseSync', handleSync);
-        socket.on('billingCustomModuleResult', handleBufferedResult); // 👈 Correct route
+        socket.on('customModuleResult', handleBufferedResult); 
         socket.on('jobStarted', handleJobStarted);
         socket.on('jobPaused', handleJobPaused);
         socket.on('jobResumed', handleJobResumed);
@@ -446,7 +430,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
         return () => {
             socket.off('databaseSync', handleSync);
-            socket.off('billingCustomModuleResult', handleBufferedResult);
+            socket.off('customModuleResult', handleBufferedResult);
             socket.off('jobStarted', handleJobStarted);
             socket.off('jobPaused', handleJobPaused);
             socket.off('jobResumed', handleJobResumed);
@@ -455,11 +439,43 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             socket.off('jobCleared', handleJobCleared);
         };
     }, [socket, setJobs, createInitialJobState]);
-	
-	
-	//-----------------------------------------------------
-	
-	
+
+    useEffect(() => {
+        const timer = setInterval(() => {
+            setJobs(prev => {
+                let changed = false;
+                const next = { ...prev };
+                const clientNow = Date.now();
+                
+                Object.keys(next).forEach(profileName => {
+                    const job = next[profileName];
+                    
+                    if (job && job.isProcessing && !job.isPaused && job.processingStartTime) {
+                        const startMs = new Date(job.processingStartTime).getTime();
+                        
+                        if (!isNaN(startMs)) {
+                            let calcTime = Math.floor((clientNow - startMs) / 1000);
+                            if (calcTime > 1800 && calcTime > ((job.processedCount || 0) * 15 + 120)) {
+                                const offsetSecs = new Date().getTimezoneOffset() * 60;
+                                calcTime += offsetSecs;
+                            }
+                            const finalTime = Math.max(0, calcTime);
+                            
+                            if (job.processingTime !== finalTime) {
+                                next[profileName] = { ...job, processingTime: finalTime };
+                                changed = true;
+                            }
+                        }
+                    }
+                });
+                
+                return changed ? next : prev;
+            });
+        }, 1000);
+        
+        return () => clearInterval(timer);
+    }, [setJobs]);
+
     useEffect(() => {
         if (!socket || !activeProfileName || !selectedProfile) return;
         const expectedJobType = selectedProfile.inventory?.customModuleApiName;
@@ -508,7 +524,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                     const moduleApiName = currentJob.formData.moduleApiName || targetProfileObj?.inventory?.customModuleApiName;
                     
                     if (moduleApiName && profileToUpdate) { 
-                        globalFieldsCache[`${profileToUpdate}_${moduleApiName}`] = fieldsReceived; 
+                        globalFieldsCache[`inv_${profileToUpdate}_${moduleApiName}`] = fieldsReceived; 
                     }
 
                     let newStaticData = { ...currentJob.formData.staticData };
@@ -529,7 +545,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             } else {
                 const failedModuleApiName = targetProfileObj?.inventory?.customModuleApiName;
                 if (failedModuleApiName && profileToUpdate) {
-                    globalFieldsCache[`${profileToUpdate}_${failedModuleApiName}`] = []; 
+                    globalFieldsCache[`inv_${profileToUpdate}_${failedModuleApiName}`] = []; 
                 }
 
                 if (profileToUpdate === activeProfileName && !isStartingBatch) {
@@ -549,12 +565,17 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         };
 
         const handleAllJobsCleared = (data: any) => {
-            // 🚨 ISOLATION: Only trigger on inv_ prefix wipes!
             if (data.jobType && data.jobType.startsWith('inv_cm_')) {
                 setJobs(prev => {
                     const next = { ...prev };
                     Object.keys(next).forEach(profile => {
-                        next[profile] = { ...next[profile], results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, formData: { ...next[profile].formData, bulkData: '', staticData: {} }, processedCount: 0, successCount: 0, errorCount: 0, _forceStopped: true, _isQueued: false } as any;
+                        next[profile] = { 
+                            ...next[profile], results: [], totalToProcess: 0, isProcessing: false, 
+                            isPaused: false, isComplete: false, 
+                            formData: { ...next[profile].formData, bulkData: '', staticData: {} }, 
+                            processedCount: 0, successCount: 0, errorCount: 0, 
+                            _forceStopped: true, _isQueued: false 
+                        } as any;
                     });
                     return next;
                 });
@@ -570,7 +591,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                     });
                     return next;
                 });
-                toast({ title: "Master Wipe Complete", description: `All databases wiped for ${expectedJobType}.` });
+                toast({ title: "Master Wipe Complete", description: `All databases wiped for ${data.jobType}.` });
             }
         };
 
@@ -635,7 +656,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         if (fetchRef.current && !forceUpdate) return;
         fetchRef.current = true; 
 
-        const cacheKey = `${activeProfileName}_${moduleName}`;
+        const cacheKey = `inv_${activeProfileName}_${moduleName}`;
         if (forceUpdate) delete globalFieldsCache[cacheKey];
 
         setIsFetchingFields(true);
@@ -645,7 +666,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             setIsFetchingFields(prev => {
                 if (prev) {
                     toast({ title: "Fetch Timeout", description: "No response from server.", variant: "destructive" });
-                    globalFieldsCache[`${activeProfileName}_${moduleName}`] = []; 
+                    globalFieldsCache[`inv_${activeProfileName}_${moduleName}`] = []; 
                     fetchRef.current = false; 
                     return false;
                 }
@@ -660,7 +681,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
     const jobStateRaw = (activeProfileName && jobs[activeProfileName]) ? jobs[activeProfileName] : createInitialJobState();
     const jobState = { ...jobStateRaw, formData: { ...jobStateRaw.formData } };
     const expectedModule = selectedProfile?.inventory?.customModuleApiName;
-    const cacheKey = activeProfileName && expectedModule ? `${activeProfileName}_${expectedModule}` : '';
+    const cacheKey = activeProfileName && expectedModule ? `inv_${activeProfileName}_${expectedModule}` : '';
     
     if (cacheKey && globalFieldsCache[cacheKey] && globalFieldsCache[cacheKey].length > 0) {
         if (!jobState.formData.availableFields || jobState.formData.availableFields.length === 0) {
@@ -682,7 +703,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             if (formData.moduleApiName !== moduleName) updateFormData({ moduleApiName: moduleName });
             
             const trueStateFields = jobs[activeProfileName]?.formData?.availableFields || [];
-            const currentCacheKey = `${activeProfileName}_${moduleName}`;
+            const currentCacheKey = `inv_${activeProfileName}_${moduleName}`;
             const cachedData = globalFieldsCache[currentCacheKey];
 
             if (cachedData !== undefined) {
@@ -723,6 +744,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
     const trackingEnabled = (formData as any).trackingEnabled || false;
     const targetHtmlField = (formData as any).targetHtmlField || '';
 
+    // 🟢 THE FIX: Now counts all profiles that have ANY valid module name configured
     const eligibleProfilesCount = useMemo(() => {
         return inventoryProfiles.filter(p => {
             const modName = p.inventory?.customModuleApiName;
@@ -782,7 +804,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                 
                 const targetModName = inventoryProfiles.find(p => p.profileName === profileName)?.inventory?.customModuleApiName || formData.moduleApiName;
                 
-                const cacheKey = `${profileName}_${targetModName}`;
+                const cacheKey = `inv_${profileName}_${targetModName}`;
                 const targetFields = globalFieldsCache[cacheKey];
 
                 if (!targetFields) {
@@ -790,6 +812,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                 }
 
                 let finalStaticData = JSON.parse(JSON.stringify(staticData));
+                let destStaticData = JSON.parse(JSON.stringify(currentJob.formData.staticData || {}));
                 let finalBulkField = bulkField; 
                 let finalTargetHtmlField = targetHtmlField; 
                 let needsMappingLater = true;
@@ -801,16 +824,22 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                     finalStaticData = mappedStatic; finalBulkField = mappedBulk; finalTargetHtmlField = mappedTargetHtml; needsMappingLater = false;
                 }
 
-                if (appendAccountName) {
-                    const accountIndex = inventoryProfiles.findIndex(p => p.profileName === profileName) + 1;
+                let resultingStaticData = applyOptions.staticFields ? finalStaticData : destStaticData;
+
+                if (applyOptions.staticFields || applyOptions.tracking) {
+                    const targetAccIndex = inventoryProfiles.findIndex(p => p.profileName === profileName) + 1;
                     const fieldsToCheck = targetFields && targetFields.length > 0 ? targetFields : (formData.availableFields || []);
                     const multilineFields = fieldsToCheck.filter((f: any) => f.data_type === 'multiline' || f.data_type === 'textarea').map((f: any) => f.api_name);
-                    const appendStr = `<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>${accountIndex}`;
                     
                     multilineFields.forEach((key: string) => {
-                        if (finalStaticData[key] !== undefined && finalStaticData[key] !== null && finalStaticData[key] !== '') {
-                            if (!String(finalStaticData[key]).includes(appendStr)) finalStaticData[key] = finalStaticData[key] + appendStr;
-                        } else { finalStaticData[key] = appendStr; }
+                        let val = resultingStaticData[key] || '';
+                        if (appendAccountName) {
+                            val = val.replace(/(<br>){5,}\d*$/g, '');
+                            val = val + BR_STRING + targetAccIndex;
+                        } else if (applyOptions.tracking) {
+                            val = val.replace(/(<br>){5,}\d*$/g, '');
+                        }
+                        resultingStaticData[key] = val;
                     });
                 }
 
@@ -821,7 +850,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                         moduleApiName: targetModName, 
                         bulkField: applyOptions.iterator ? finalBulkField : currentJob.formData.bulkField, 
                         bulkData: applyOptions.iterator ? bulkData : currentJob.formData.bulkData, 
-                        staticData: applyOptions.staticFields ? finalStaticData : currentJob.formData.staticData, 
+                        staticData: resultingStaticData, 
                         crossProfileSourceFields: applyOptions.staticFields ? (needsMappingLater ? formData.availableFields : undefined) : currentJob.formData.crossProfileSourceFields,
                         delay: applyOptions.execution ? delay : currentJob.formData.delay, 
                         concurrency: applyOptions.execution ? concurrency : currentJob.formData.concurrency, 
@@ -846,17 +875,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
         if (currentJob.isPaused) {
             socket.emit('resumeJob', { profileName: activeProfileName, jobType: exactActiveModule });
-            setJobs(prev => ({ 
-                ...prev, 
-                [activeProfileName]: { 
-                    ...prev[activeProfileName], 
-                    isPaused: false, 
-                    isProcessing: !(prev[activeProfileName] as any)._isQueued, 
-                    _forcePaused: false, 
-                    _forceStopped: false,
-                    processingStartTime: new Date(Date.now() - ((prev[activeProfileName].processingTime || 0) * 1000))
-                } as any 
-            }));
+            setJobs(prev => ({ ...prev, [activeProfileName]: { ...prev[activeProfileName], isPaused: false, isProcessing: true, _forcePaused: false, _forceStopped: false } as any }));
             toast({ title: "Job Resumed!", description: `Continuing remaining items seamlessly.` });
         } else {
             socket.emit('pauseJob', { profileName: activeProfileName, jobType: exactActiveModule });
@@ -865,16 +884,13 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         }
     };
 
+    // 🟢 THE FIX: Now counts all active jobs across ALL modules
     const activeMasterJobs = useMemo(() => {
         let running = 0; let paused = 0; let queued = 0;
         inventoryProfiles.forEach(p => {
             const job = jobs[p.profileName];
             const modName = p.inventory?.customModuleApiName;
-            
-            // 🚨 THE FIX: Ignore the job if it belongs to Billing!
-            const isBillingJob = job?.formData?.moduleApiName?.startsWith('bil_');
-            
-            if (!isBillingJob && modName && modName.trim() !== '' && modName.trim() !== 'cm_' && job?.formData?.moduleApiName === modName) {
+            if (modName && modName.trim() !== '' && modName.trim() !== 'cm_' && job?.formData?.moduleApiName === modName) {
                 if (job.isProcessing && job.isPaused) paused++;
                 else if (job.isProcessing && !job.isPaused) running++;
                 else if ((job as any)._isQueued) queued++;
@@ -883,81 +899,82 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         return { running, paused, queued, totalProcessing: running + paused + queued };
     }, [jobs, inventoryProfiles]);
 
+    // 🟢 THE FIX: Now pauses ALL active profiles regardless of module name
     const handleMasterPauseAll = () => {
-        const profilesToPause = billingProfiles.filter(p => {
+        const profilesToPause = inventoryProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && 
+            const modName = p.inventory?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
                    ((job.isProcessing && !job.isPaused) || (job as any)._isQueued);
         });
 
-        setJobs(prev => {
-            const next = { ...prev };
-            profilesToPause.forEach(p => {
-                const job = prev[p.profileName];
-                if (job) {
-                    const wasQueued = !!(job as any)._isQueued;
-                    next[p.profileName] = { 
-                        ...job, 
-                        isPaused: true, 
-                        isProcessing: !wasQueued, 
-                        _isQueued: wasQueued,
-                        _forcePaused: true, 
-                        _forceStopped: false 
-                    } as any;
-                }
-            });
-            return next;
-        });
-
+        let pausedCount = 0;
         profilesToPause.forEach(p => {
-            // 🚀 FIX: Added 'bil_' prefix to the emit
-            socket?.emit('pauseJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` }); 
+            const job = jobs[p.profileName];
+            const wasQueued = (job as any)._isQueued;
+            
+            setJobs(prev => ({ 
+                ...prev, 
+                [p.profileName]: { 
+                    ...prev[p.profileName], 
+                    isPaused: true, 
+                    isProcessing: !wasQueued,
+                    _isQueued: wasQueued, 
+                    _forcePaused: true, 
+                    _forceStopped: false 
+                } as any 
+            }));
+            
+            socket?.emit('pauseJob', { profileName: p.profileName, jobType: `inv_${job.formData?.moduleApiName}` }); 
+            pausedCount++;
         });
-        toast({ title: "Master Batch Paused", description: `Paused ${profilesToPause.length} accounts.` });
+        toast({ title: "Master Batch Paused", description: `Paused ${pausedCount} accounts.` });
     };
 
+    // 🟢 THE FIX: Now resumes ALL paused profiles regardless of module name
     const handleMasterForceResume = () => {
-        const pausedProfiles = billingProfiles.filter(p => {
+        const pausedProfiles = inventoryProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && 
+            const modName = p.inventory?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
                    (job.isPaused || (job as any)._forcePaused);
         });
 
-        setJobs(prev => {
-            const next = { ...prev };
-            pausedProfiles.forEach(p => {
-                const job = prev[p.profileName];
-                if (job) {
-                    const isQueued = !!(job as any)._isQueued;
-                    next[p.profileName] = { 
-                        ...job, 
-                        isPaused: false, 
-                        isProcessing: !isQueued, 
-                        _isQueued: isQueued,
-                        _forcePaused: false, 
-                        _forceStopped: false 
-                    } as any;
-                }
-            });
-            return next;
-        });
-
+        let resumedCount = 0;
         pausedProfiles.forEach(p => {
-            // 🚀 FIX: Added 'bil_' prefix to the emit
-            socket?.emit('resumeJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` }); 
+            const job = jobs[p.profileName];
+            const isQueued = (job as any)._isQueued;
+            
+            setJobs(prev => ({ 
+                ...prev, 
+                [p.profileName]: { 
+                    ...prev[p.profileName], 
+                    isPaused: false, 
+                    isProcessing: !isQueued,
+                    _isQueued: isQueued, 
+                    _forcePaused: false, 
+                    _forceStopped: false 
+                } as any 
+            }));
+            
+            socket?.emit('resumeJob', { profileName: p.profileName, jobType: `inv_${job.formData?.moduleApiName}` }); 
+            resumedCount++;
         });
-        toast({ title: "Master Batch Resumed", description: `Resumed ${pausedProfiles.length} accounts.` });
+        toast({ title: "Master Batch Resumed", description: `Resumed ${resumedCount} accounts.` });
     };
 
+    // 🟢 THE FIX: Now stops ALL active profiles regardless of module name
     const handleMasterStopAll = () => {
-        const activeProfiles = billingProfiles.filter(p => {
+        const activeProfiles = inventoryProfiles.filter(p => {
             const job = jobs[p.profileName];
-            return job && job.formData?.moduleApiName === formData.moduleApiName && (job.isProcessing || (job as any)._isQueued);
+            const modName = p.inventory?.customModuleApiName;
+            return job && modName && modName.trim() !== 'cm_' && job.formData?.moduleApiName === modName && 
+                   (job.isProcessing || (job as any)._isQueued);
         });
         
         activeProfiles.forEach(p => {
-            // 🚀 FIX: Added 'bil_' prefix to the emit
-            socket?.emit('endJob', { profileName: p.profileName, jobType: `bil_${formData.moduleApiName}` });
+            const job = jobs[p.profileName];
+            socket?.emit('endJob', { profileName: p.profileName, jobType: `inv_${job.formData?.moduleApiName}` });
             setJobs(prev => ({ ...prev, [p.profileName]: { ...prev[p.profileName], isProcessing: false, isPaused: false, isComplete: true, _forceStopped: true, _isQueued: false } as any }));
         });
         
@@ -965,8 +982,8 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
     };
 
     const handleMasterBatchStart = async () => {
-        const configuredProfiles = billingProfiles.filter(p => {
-            const modName = p.billing?.customModuleApiName;
+        const configuredProfiles = inventoryProfiles.filter(p => {
+            const modName = p.inventory?.customModuleApiName;
             return modName && modName.trim() !== 'cm_' && modName.trim() !== '';
         });
 
@@ -976,8 +993,8 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         if (idleProfiles.length === 0) return toast({ title: "All Accounts Active", description: "All your configured accounts are already running or waiting in line.", variant: "default" });
 
         const missingFieldsProfiles = idleProfiles.filter(p => { 
-            const profileModName = p.billing?.customModuleApiName;
-            const cacheKey = `${p.profileName}_${profileModName}`; 
+            const profileModName = p.inventory?.customModuleApiName;
+            const cacheKey = `inv_${p.profileName}_${profileModName}`; 
             return !globalFieldsCache[cacheKey] || globalFieldsCache[cacheKey].length === 0; 
         });
 
@@ -987,23 +1004,31 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
         await Promise.all(missingFieldsProfiles.map(profileData => {
             return new Promise<void>((resolve) => {
                 const profileName = profileData.profileName;
-                const profileModName = profileData.billing?.customModuleApiName;
-                const cacheKey = `${profileName}_${profileModName}`;
+                const profileModName = profileData.inventory?.customModuleApiName;
+                const cacheKey = `inv_${profileName}_${profileModName}`;
 
                 const handleTempResult = (res: any) => {
                     const targetProfile = res.profileName || activeProfileName;
                     if (targetProfile === profileName) {
+                        socket?.off('fetchModuleFieldsResult', handleTempResult);
                         socket?.off('customModuleFieldsResult', handleTempResult);
-                        if (res.success && res.fields) globalFieldsCache[cacheKey] = res.fields;
+                        socket?.off('moduleFieldsResult', handleTempResult);
+                        
+                        const fields = res.fields || res.data || res.moduleFields;
+                        if (res.success && fields) globalFieldsCache[cacheKey] = fields;
                         resolve();
                     }
                 };
 
+                socket?.on('fetchModuleFieldsResult', handleTempResult);
                 socket?.on('customModuleFieldsResult', handleTempResult);
-                socket?.emit('fetchBillingModuleFields', { selectedProfileName: profileName, moduleApiName: profileModName, activeProfile: profileData });
+                socket?.on('moduleFieldsResult', handleTempResult);
+                socket?.emit('fetchModuleFields', { selectedProfileName: profileName, moduleApiName: profileModName, activeProfile: profileData });
                 
                 setTimeout(() => { 
-                    socket?.off('customModuleFieldsResult', handleTempResult); 
+                    socket?.off('fetchModuleFieldsResult', handleTempResult); 
+                    socket?.off('customModuleFieldsResult', handleTempResult);
+                    socket?.off('moduleFieldsResult', handleTempResult);
                     resolve(); 
                 }, 8000);
             });
@@ -1015,8 +1040,8 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
         idleProfiles.forEach(profileData => {
             const profileName = profileData.profileName;
-            const profileModName = profileData.billing?.customModuleApiName;
-            const cacheKey = `${profileName}_${profileModName}`;
+            const profileModName = profileData.inventory?.customModuleApiName;
+            const cacheKey = `inv_${profileName}_${profileModName}`;
             const targetFields = globalFieldsCache[cacheKey];
 
             if (!targetFields || targetFields.length === 0) {
@@ -1041,7 +1066,15 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                     safeStaticData = job.formData.staticData || {}; safeBulkField = job.formData.bulkField || ''; safeTargetHtmlField = (job.formData as any).targetHtmlField || '';
                 }
             } else {
-                return; 
+                finalBulkData = formData.bulkData;
+                if (formData.availableFields && formData.availableFields.length > 0 && targetFields && targetFields.length > 0) {
+                    const { mappedStatic, mappedBulk, mappedTargetHtml } = performSmartMapping(formData.availableFields, targetFields, formData.staticData, formData.bulkField, (formData as any).targetHtmlField || '');
+                    safeStaticData = mappedStatic; safeBulkField = mappedBulk; safeTargetHtmlField = mappedTargetHtml;
+                } else {
+                    safeStaticData = formData.staticData || {}; 
+                    safeBulkField = formData.bulkField || ''; 
+                    safeTargetHtmlField = (formData as any).targetHtmlField || '';
+                }
             }
 
             if (!safeBulkField) {
@@ -1053,7 +1086,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                 return;
             }
 
-            const accountIndex = billingProfiles.findIndex(p => p.profileName === profileName) + 1;
+            const accountIndex = inventoryProfiles.findIndex(p => p.profileName === profileName) + 1;
             const multilineFields = targetFields.filter((f: any) => f.data_type === 'multiline' || f.data_type === 'textarea').map((f: any) => f.api_name);
 
             payloads.push({
@@ -1072,13 +1105,16 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             return toast({ title: "Cannot Start Batch", description: errorMsg, variant: "destructive" });
         }
 
+        // 🚨 THE FIX: Force state to know the target API name so it doesn't wipe
         setJobs(prev => {
             const next = { ...prev };
             payloads.forEach(p => {
                 const itemsToProcess = p.bulkData ? p.bulkData.split('\n').filter((x: string) => x.trim()).length : 0;
                 const existingJob = next[p.selectedProfileName] || createInitialJobState();
                 next[p.selectedProfileName] = {
-                    ...existingJob, isProcessing: false, isPaused: false, isComplete: false,
+                    ...existingJob, 
+                    formData: { ...existingJob.formData, moduleApiName: p.moduleApiName }, 
+                    isProcessing: false, isPaused: false, isComplete: false,
                     _forceStopped: false, _forcePaused: false, _isQueued: true, _ignition: false,
                     results: [], processingTime: 0, totalToProcess: itemsToProcess,
                     processedCount: 0, successCount: 0, errorCount: 0, processingStartTime: null 
@@ -1087,11 +1123,19 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
             return next;
         });
 
-        // 🚀 FIX: Removed the buggy duplicate emit logic and locked it to the billing route
-        socket?.emit('startMasterBulkBillingCustomJob', {
-            moduleApiName: formData.moduleApiName,
-            concurrency: masterBatchConcurrency,
-            payloads: payloads
+        // 🚨 THE FIX: Group payloads by module API name and emit them in distinct batches
+        const payloadsByModule: Record<string, any[]> = {};
+        payloads.forEach(p => {
+            if (!payloadsByModule[p.moduleApiName]) payloadsByModule[p.moduleApiName] = [];
+            payloadsByModule[p.moduleApiName].push(p);
+        });
+
+        Object.keys(payloadsByModule).forEach(modName => {
+            socket?.emit('startMasterBatchCustomJob', {
+                moduleApiName: modName,
+                concurrency: masterBatchConcurrency,
+                payloads: payloadsByModule[modName]
+            });
         });
         
         toast({ title: "Master Batch Running", description: `Sent ${payloads.length} accounts to the background server.` });
@@ -1217,7 +1261,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                                                             <Button size="sm" className={cn("flex-1 font-bold", jobState.isPaused ? "bg-green-600 hover:bg-green-700 text-white" : "")} variant={jobState.isPaused ? "default" : "outline"} onClick={handlePauseResume} disabled={(jobState as any)._isQueued}>{jobState.isPaused ? <Play className="mr-1 h-3 w-3" /> : <Pause className="mr-1 h-3 w-3" />}{jobState.isPaused ? "Resume" : "Pause"}</Button>
                                                             {/* 🚀 THE FIX: EXACT SINGLE MODULE LOOKUP FOR SINGLE STOP */}
                                                             <Button size="sm" variant="destructive" className="flex-1" onClick={() => { 
-                                                                const exactActiveModule = jobs[activeProfileName]?.formData?.moduleApiName || inventoryProfiles.find(p => p.profileName === activeProfileName)?.inventory?.customModuleApiName || formData.moduleApiName;
+                                                                const exactActiveModule = `inv_${jobs[activeProfileName]?.formData?.moduleApiName || inventoryProfiles.find(p => p.profileName === activeProfileName)?.inventory?.customModuleApiName || formData.moduleApiName}`;
                                                                 socket?.emit('endJob', { profileName: activeProfileName, jobType: exactActiveModule }); 
                                                                 setJobs(prev => ({ ...prev, [activeProfileName]: { ...prev[activeProfileName], isProcessing: false, isPaused: false, isComplete: true, _forceStopped: true, _isQueued: false } as any })); 
                                                             }}><Square className="mr-1 h-3 w-3" /> Stop</Button>

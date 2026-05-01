@@ -1,11 +1,11 @@
-// --- FILE: server/postgres.js ---
+// --- FILE: server/postgres-billing.js ---
 const { Pool } = require('pg');
 
-// Connect to your local or hosted PostgreSQL database
+// Connect to the ISOLATED BILLING PostgreSQL database
 const pool = new Pool({
     user: process.env.PG_USER || 'postgres',
     host: process.env.PG_HOST || 'localhost',
-    database: process.env.PG_DB || 'zoho_finance',
+    database: process.env.PG_BILLING_DB || 'zoho_billing', // 👈 THE ISOLATION KEY
     password: process.env.PG_PASSWORD || 'admin',
     port: process.env.PG_PORT || 5432,
     max: 20, // Allow 20 simultaneous connections
@@ -44,9 +44,9 @@ const initDB = async () => {
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Main PostgreSQL Database Initialized.");
+        console.log("🟣 Billing PostgreSQL Database Initialized.");
     } catch (err) {
-        console.error("❌ [DB ERROR] Failed to initialize Main PostgreSQL:", err.message);
+        console.error("❌ [DB ERROR] Failed to initialize Billing PostgreSQL:", err.message);
     }
 };
 
@@ -92,6 +92,7 @@ module.exports = {
     },
 
     getAllJobs: async () => {
+        // 🚨 THE FIX: This now packages the latest 500 rows inside the sync payload!
         const { rows } = await pool.query(`
             SELECT j.*, 
             (SELECT COUNT(*) FROM job_results WHERE jobId = j.id AND success IS NOT NULL) as "processedCount",

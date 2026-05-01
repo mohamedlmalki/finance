@@ -1,14 +1,14 @@
-// --- FILE: server/postgres.js ---
+// --- FILE: server/postgres-inventory.js ---
 const { Pool } = require('pg');
 
-// Connect to your local or hosted PostgreSQL database
+// Connect to the ISOLATED INVENTORY PostgreSQL database
 const pool = new Pool({
     user: process.env.PG_USER || 'postgres',
     host: process.env.PG_HOST || 'localhost',
-    database: process.env.PG_DB || 'zoho_finance',
+    database: process.env.PG_INVENTORY_DB || 'zoho_inventory', // 👈 THE ISOLATION KEY
     password: process.env.PG_PASSWORD || 'admin',
     port: process.env.PG_PORT || 5432,
-    max: 20, // Allow 20 simultaneous connections
+    max: 20,
 });
 
 const initDB = async () => {
@@ -44,9 +44,9 @@ const initDB = async () => {
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("✅ Main PostgreSQL Database Initialized.");
+        console.log("cyanBold", "🔵 Inventory PostgreSQL Database Initialized.");
     } catch (err) {
-        console.error("❌ [DB ERROR] Failed to initialize Main PostgreSQL:", err.message);
+        console.error("❌ [DB ERROR] Failed to initialize Inventory PostgreSQL:", err.message);
     }
 };
 
@@ -70,7 +70,6 @@ module.exports = {
 
     insertJobResult: async (jobId, result) => {
         const details = result.details || result.error || null;
-        // ALLOW NULL FOR WAITING STATE
         const success = result.success === null ? null : (result.success ? true : false);
         const fullResponseStr = result.fullResponse ? JSON.stringify(result.fullResponse) : null;
         const identifier = result.email || result.identifier || null;
@@ -92,6 +91,7 @@ module.exports = {
     },
 
     getAllJobs: async () => {
+        // 🚨 THE REFRESH FIX FOR INVENTORY
         const { rows } = await pool.query(`
             SELECT j.*, 
             (SELECT COUNT(*) FROM job_results WHERE jobId = j.id AND success IS NOT NULL) as "processedCount",

@@ -2,7 +2,8 @@
 const { makeApiCall, parseError, cliColors } = require('./utils');
 const { Queue } = require('bullmq');
 const { connection } = require('./worker'); 
-const db = require('./postgres'); 
+// 🚨 CHANGED: Now completely isolated to the Billing Database
+const db = require('./postgres-billing'); 
 
 const handleFetchBillingModuleFields = async (socket, data) => {
     const { selectedProfileName, moduleApiName, activeProfile } = data;
@@ -89,7 +90,7 @@ const handleStartBulkBillingCustomJob = async (socket, data) => {
                 data: { 
                     rowData: payload, 
                     identifier, 
-                    moduleApiName: jobType, // 👈 THE FIX: Pass the bil_ prefixed variable here!
+                    moduleApiName: jobType, 
                     actualTargetModule: moduleApiName, 
                     selectedProfileName, 
                     delay, activeProfile, rowNumber: baseRowNumber + index, trackingEnabled, campaignName, targetHtmlField,

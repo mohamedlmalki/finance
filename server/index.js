@@ -10,7 +10,9 @@ const {
 } = require('./utils');
 
 // --- ENGINE IMPORTS ---
-const db = require('./postgres'); 
+const db = require('./postgres'); // Original Database (Main/Flow)
+const billingDb = require('./postgres-billing'); // Isolated Billing DB
+const inventoryDb = require('./postgres-inventory'); // 🚨 NEW ISOLATED INVENTORY DB
 const { listenForWorkers } = require('./redis-pubsub');
 
 // --- HANDLER IMPORTS ---
@@ -28,6 +30,11 @@ require('dotenv').config();
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } }); 
+
+// 🚀 START ISOLATED WORKERS AUTOMATICALLY
+try { require('./worker-billing.js'); } catch (e) {}
+try { require('./worker-inventory.js'); } catch (e) {}
+try { require('./worker-flow.js'); } catch (e) {} // 👈 ADDED THIS LINE
 
 listenForWorkers(io);
 
@@ -204,8 +211,11 @@ io.on('connection', (socket) => {
 
     socket.on('requestDatabaseSync', async () => {
         try {
+            // 🚨 MERGED: Gather data from ALL databases for total amnesia fix
             const allJobs = await db.getAllJobs();
-            socket.emit('databaseSync', allJobs);
+            const allBillingJobs = await billingDb.getAllJobs();
+            const allInventoryJobs = await inventoryDb.getAllJobs();
+            socket.emit('databaseSync', [...allJobs, ...allBillingJobs, ...allInventoryJobs]);
         } catch (error) { console.error('DB Sync Error:', error); }
     }); 
 
@@ -248,38 +258,92 @@ io.on('connection', (socket) => {
 
     socket.on('clearJob', async (data) => {
         const { profileName, jobType } = data;
+        let vaporizedCount = 0;
+        let deletedJobsCount = 0;
+        let deletedResultsCount = 0;
+        
         try {
-            socket.emit('wipeProgress', { profileName, jobType, message: `Initiating wipe for ${profileName}...` });
-            await db.query("UPDATE jobs SET status = 'ended' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            console.log(`\n${cliColors.redBold}☢️ [WIPE PROTOCOL INITIATED] Target Account: ${profileName} | Module: ${jobType}${cliColors.reset}`);
+            socket.emit('wipeProgress', { profileName, jobType, message: `Haulting active workers for ${profileName}...` });
             
+            // 🚨 TRAFFIC COP: Route to Correct Database!
+            const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
+            const targetDbName = jobType.startsWith('bil_') ? 'BILLING DB' : (jobType.startsWith('inv_') ? 'INVENTORY DB' : 'MAIN DB');
+
+            const pauseSql = `UPDATE jobs SET status = 'ended' WHERE profilename = '${profileName}' AND jobtype = '${jobType}'`;
+            console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${pauseSql}${cliColors.reset}`);
+            await targetDb.query("UPDATE jobs SET status = 'ended' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            
+            await new Promise(r => setTimeout(r, 500)); 
+
             if (jobType.startsWith('Flow_')) {
                 const jobId = `${jobType}_${profileName}`;
                 if (flowHandler.killClock) flowHandler.killClock(jobId);
+                console.log(`  ${cliColors.yellowBold}➤ [SYSTEM COMMAND] flowHandler.killClock('${jobId}')${cliColors.reset}`);
             } else {
+                socket.emit('wipeProgress', { profileName, jobType, message: `Obliterating Redis Queues...` });
                 const { Queue } = require('bullmq');
                 const { connection } = require('./worker');
                 const queueName = `${jobType}Queue_${profileName}`;
                 const targetQueue = new Queue(queueName, { connection });
                 try {
+                    console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] targetQueue.pause() on '${queueName}'${cliColors.reset}`);
                     await targetQueue.pause(); 
+                    console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] targetQueue.obliterate({ force: true }) on '${queueName}'${cliColors.reset}`);
                     await targetQueue.obliterate({ force: true }); 
+                    vaporizedCount++;
                 } catch (e) {
+                    console.log(`  ${cliColors.gray}➤ [REDIS FALLBACK] Obliterate failed. Finding keys matching: bull:${queueName}:*${cliColors.reset}`);
                     const rawKeys = await connection.keys(`bull:${queueName}:*`);
-                    if (rawKeys.length > 0) await connection.del(...rawKeys);
+                    if (rawKeys.length > 0) {
+                        console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] connection.del(${rawKeys.length} keys found)${cliColors.reset}`);
+                        await connection.del(...rawKeys);
+                        vaporizedCount++;
+                    }
                 } finally {
                     await targetQueue.close();
                 }
             }
-            await db.query("DELETE FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            
+            socket.emit('wipeProgress', { profileName, jobType, message: `Shredding database records...` });
+            await new Promise(r => setTimeout(r, 500));
+
+            const countSql = `SELECT COUNT(*) FROM job_results WHERE jobId = '${jobType}_${profileName}'`;
+            console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${countSql}${cliColors.reset}`);
+            const countRes = await targetDb.query("SELECT COUNT(*) FROM job_results WHERE jobId = $1", [`${jobType}_${profileName}`]);
+            deletedResultsCount = countRes.rows[0].count;
+
+            const deleteSql = `DELETE FROM jobs WHERE profilename = '${profileName}' AND jobtype = '${jobType}'`;
+            console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${deleteSql} (Triggers CASCADE delete on job_results)${cliColors.reset}`);
+            const delRes = await targetDb.query("DELETE FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            deletedJobsCount = delRes.rowCount;
+
+            console.log(`\n${cliColors.redBold}🟥 [NUCLEAR ACCOUNT WIPE EXECUTED] Target: ${profileName} (${jobType})${cliColors.reset}`);
+            console.log(`=================================================`);
+            console.log(`✅ Redis Queues Vaporized: ${vaporizedCount}`);
+            console.log(`✅ Postgres Jobs Deleted: ${deletedJobsCount}`);
+            console.log(`✅ Postgres Results Deleted: ${deletedResultsCount} (Cascade)`);
+            console.log(`=================================================\n`);
+
+            socket.emit('wipeProgress', { profileName, jobType, message: `Wipe Complete.` });
+            await new Promise(r => setTimeout(r, 400));
             socket.emit('jobCleared', { profileName, jobType });
         } catch (error) {
+            console.log(`\n${cliColors.redBold}❌ [WIPE ERROR] ${error.message}${cliColors.reset}`);
             socket.emit('wipeProgress', { profileName, jobType, message: `Error: ${error.message}`, error: true });
         }
     });
 
     socket.on('clearAllJobs', async (data) => {
         const { jobType } = data;
+        let vaporizedCount = 0;
+        let deletedJobsCount = 0;
+        let deletedResultsCount = 0;
+
         try {
+            console.log(`\n${cliColors.redBold}☢️ [MASTER WIPE PROTOCOL INITIATED] Target Module: ${jobType}${cliColors.reset}`);
+            socket.emit('wipeProgress', { jobType, message: `Stopping all active workers...` });
+            
             let targetJobTypes = [jobType];
             if (jobType && jobType.startsWith('cm_')) {
                 const profiles = readProfiles();
@@ -292,55 +356,101 @@ io.on('connection', (socket) => {
             }
             
             for (const currentJobType of targetJobTypes) {
-                await db.query("UPDATE jobs SET status = 'ended' WHERE jobtype = $1", [currentJobType]);
+                // 🚨 TRAFFIC COP: Route to Correct Database!
+                const targetDb = currentJobType.startsWith('bil_') ? billingDb : (currentJobType.startsWith('inv_') ? inventoryDb : db);
+                const targetDbName = currentJobType.startsWith('bil_') ? 'BILLING DB' : (currentJobType.startsWith('inv_') ? 'INVENTORY DB' : 'MAIN DB');
+
+                console.log(`\n  ${cliColors.gray}➤ Target Sub-Module: ${currentJobType}${cliColors.reset}`);
+                
+                const pauseSql = `UPDATE jobs SET status = 'ended' WHERE jobtype = '${currentJobType}'`;
+                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${pauseSql}${cliColors.reset}`);
+                await targetDb.query("UPDATE jobs SET status = 'ended' WHERE jobtype = $1", [currentJobType]);
+                
+                await new Promise(r => setTimeout(r, 500)); 
                 
                 if (currentJobType.startsWith('Flow_')) {
                     const profiles = readProfiles();
                     profiles.forEach(p => {
                         if (flowHandler.killClock) flowHandler.killClock(`Flow_${p.profileName}_${p.profileName}`);
                     });
+                    console.log(`  ${cliColors.yellowBold}➤ [SYSTEM COMMAND] Terminated all Flow clocks for ${currentJobType}${cliColors.reset}`);
                 } else {
+                    socket.emit('wipeProgress', { jobType, message: `Obliterating BullMQ Redis Queues for ${currentJobType}...` });
                     const { Queue } = require('bullmq');
                     const { connection } = require('./worker');
+                    
+                    console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] connection.keys('bull:${currentJobType}Queue_*:meta')${cliColors.reset}`);
                     const metaKeys = await connection.keys(`bull:${currentJobType}Queue_*:meta`);
+                    
                     if (metaKeys.length > 0) {
                         for (const metaKey of metaKeys) {
                             const queueName = metaKey.replace('bull:', '').replace(':meta', '');
-                            const profileName = queueName.replace(`${currentJobType}Queue_`, '');
-                            socket.emit('wipeProgress', { jobType, message: `🧹 Obliterating Account: ${profileName}...` });
                             const q = new Queue(queueName, { connection });
                             try {
+                                console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] BullMQ.obliterate() on '${queueName}'${cliColors.reset}`);
                                 await q.pause(); 
                                 await q.obliterate({ force: true }); 
+                                vaporizedCount++;
                             } catch (e) {
+                                console.log(`  ${cliColors.gray}➤ [REDIS FALLBACK] connection.del() on all keys matching 'bull:${queueName}:*'${cliColors.reset}`);
                                 const rawKeys = await connection.keys(`bull:${queueName}:*`);
-                                if (rawKeys.length > 0) await connection.del(...rawKeys);
+                                if (rawKeys.length > 0) {
+                                    await connection.del(...rawKeys);
+                                    vaporizedCount++;
+                                }
                             } finally {
                                 await q.close();
                             }
                         }
+                    } else {
+                        console.log(`  ${cliColors.gray}➤ [REDIS] No active queues found for ${currentJobType}.${cliColors.reset}`);
                     }
                 }
-                await db.query("DELETE FROM jobs WHERE jobtype = $1", [currentJobType]);
+                
+                socket.emit('wipeProgress', { jobType, message: `Shredding database records for ${currentJobType}...` });
+                await new Promise(r => setTimeout(r, 500));
+
+                const countSql = `SELECT COUNT(*) FROM job_results WHERE jobId LIKE '${currentJobType}_%'`;
+                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${countSql}${cliColors.reset}`);
+                const countRes = await targetDb.query("SELECT COUNT(*) FROM job_results WHERE jobId LIKE $1", [`${currentJobType}_%`]);
+                deletedResultsCount += parseInt(countRes.rows[0].count) || 0;
+
+                const deleteSql = `DELETE FROM jobs WHERE jobtype = '${currentJobType}'`;
+                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${deleteSql} (Triggers CASCADE)${cliColors.reset}`);
+                const delRes = await targetDb.query("DELETE FROM jobs WHERE jobtype = $1", [currentJobType]);
+                deletedJobsCount += delRes.rowCount;
             }
+
+            console.log(`\n${cliColors.redBold}🟥 [NUCLEAR MASTER WIPE EXECUTED] Target: ${jobType}${cliColors.reset}`);
+            console.log(`=================================================`);
+            console.log(`✅ Redis Queues Vaporized: ${vaporizedCount}`);
+            console.log(`✅ Postgres Jobs Deleted: ${deletedJobsCount}`);
+            console.log(`✅ Postgres Results Deleted: ${deletedResultsCount} (Cascade)`);
+            console.log(`=================================================\n`);
+
+            socket.emit('wipeProgress', { jobType, message: `Wipe Complete.` });
+            await new Promise(r => setTimeout(r, 400));
             socket.emit('allJobsCleared', { jobType });
         } catch (error) {
+            console.log(`\n${cliColors.redBold}❌ [MASTER WIPE ERROR] ${error.message}${cliColors.reset}`);
             socket.emit('wipeProgress', { jobType, message: `Fatal Error during wipe: ${error.message}`, error: true });
         }
     });
 
     socket.on('pauseJob', async ({ profileName, jobType }) => {
         try {
-            const jobRecord = await db.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
+
+            const jobRecord = await targetDb.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
             if (jobRecord.rows.length === 0) return;
             const currentStatus = jobRecord.rows[0].status;
             let isQueued = false;
 
             if (currentStatus === 'queued') {
-                await db.query("UPDATE jobs SET status = 'paused_queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+                await targetDb.query("UPDATE jobs SET status = 'paused_queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
                 isQueued = true;
             } else if (currentStatus === 'running') {
-                await db.query("UPDATE jobs SET status = 'paused' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+                await targetDb.query("UPDATE jobs SET status = 'paused' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
                 
                 if (!jobType.startsWith('Flow_')) {
                     try {
@@ -357,16 +467,18 @@ io.on('connection', (socket) => {
 
     socket.on('resumeJob', async ({ profileName, jobType }) => {
         try {
-            const jobRecord = await db.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
+
+            const jobRecord = await targetDb.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
             if (jobRecord.rows.length === 0) return;
             const currentStatus = jobRecord.rows[0].status;
             let isQueued = false;
 
             if (currentStatus === 'paused_queued') {
-                await db.query("UPDATE jobs SET status = 'queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+                await targetDb.query("UPDATE jobs SET status = 'queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
                 isQueued = true;
             } else if (currentStatus === 'paused') {
-                await db.query("UPDATE jobs SET status = 'running' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+                await targetDb.query("UPDATE jobs SET status = 'running' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
                 
                 if (!jobType.startsWith('Flow_')) {
                     try {
@@ -383,7 +495,9 @@ io.on('connection', (socket) => {
 
     socket.on('endJob', async ({ profileName, jobType }) => {
         try {
-            await db.query("UPDATE jobs SET status = 'ended' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
+            const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
+
+            await targetDb.query("UPDATE jobs SET status = 'ended' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
             if (jobType.startsWith('Flow_')) {
                 const jobId = `${jobType}_${profileName}`;
                 if (flowHandler.killClock) flowHandler.killClock(jobId);

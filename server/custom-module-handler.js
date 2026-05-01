@@ -2,7 +2,8 @@
 const { makeApiCall, parseError, cliColors } = require('./utils');
 const { Queue } = require('bullmq');
 const { connection } = require('./worker'); 
-const db = require('./postgres'); 
+// 🚨 CHANGED: Isolated Inventory DB
+const db = require('./postgres-inventory'); 
 
 const handleFetchModuleFields = async (socket, data) => {
     const { selectedProfileName, moduleApiName, activeProfile } = data;
@@ -25,7 +26,6 @@ const handleFetchModuleFields = async (socket, data) => {
 };
 
 const handleStartBulkCustomJob = async (socket, data) => {
-    // 🚨 ADDED DB SEARCH LOGIC FOR INVENTORY
     if (data.isSearchRequest) {
         try {
             const res = await db.query("SELECT * FROM job_results WHERE profileName = $1 AND jobId = $2 AND (identifier ILIKE $3 OR details ILIKE $3) ORDER BY timestamp DESC LIMIT 500", [data.selectedProfileName, `inv_${data.moduleApiName}_${data.selectedProfileName}`, `%${data.query}%`]);
@@ -33,7 +33,6 @@ const handleStartBulkCustomJob = async (socket, data) => {
         } catch(e) {}
         return;
     }
-    // 🚨 ADDED DB EXPORT LOGIC FOR INVENTORY
     if (data.isExportRequest) {
         try {
             const res = await db.query("SELECT * FROM job_results WHERE profileName = $1 AND jobId = $2 ORDER BY timestamp DESC", [data.selectedProfileName, `inv_${data.moduleApiName}_${data.selectedProfileName}`]);
@@ -47,7 +46,6 @@ const handleStartBulkCustomJob = async (socket, data) => {
     console.log(`\n${cliColors.cyanBold}🧠 [INVENTORY SINGLE BATCH]${cliColors.reset} Pushing account ${cliColors.whiteBold}${selectedProfileName}${cliColors.reset} to Redis Queue...`);
 
     try {
-        // 🚨 ISOLATION PREFIX: inv_
         const jobType = `inv_${moduleApiName}`;
         const queueName = `${jobType}Queue_${selectedProfileName}`;
         const accountQueue = new Queue(queueName, { connection });
@@ -71,19 +69,14 @@ const handleStartBulkCustomJob = async (socket, data) => {
             return { 
                 name: 'processModule', 
                 data: { 
-                    rowData: payload, 
-                    identifier, 
-                    moduleApiName: jobType, // 👈 THE FIX: Pass the inv_ prefixed variable here!
-                    actualTargetModule: moduleApiName, 
-                    selectedProfileName, 
-                    delay, activeProfile, rowNumber: baseRowNumber + index, trackingEnabled, campaignName, targetHtmlField,
-                    appendAccountName, accountIndex, multilineFields
+                    rowData: payload, identifier, moduleApiName: jobType, actualTargetModule: moduleApiName, 
+                    selectedProfileName, delay, activeProfile, rowNumber: baseRowNumber + index, trackingEnabled, 
+                    campaignName, targetHtmlField, appendAccountName, accountIndex, multilineFields
                 }, 
                 opts: { removeOnComplete: true, removeOnFail: true } 
             };
         });
 
-        // 🚨 ISOLATION PREFIX: inv_
         const jobId = `${jobType}_${selectedProfileName}`;
         await db.query("DELETE FROM jobs WHERE id = $1", [jobId]); 
 
@@ -113,13 +106,8 @@ const handleStartMasterBatch = async (socket, data) => {
 
     try {
         for (const payloadData of payloads) {
-            const { 
-                selectedProfileName, bulkField, bulkData, staticData, delay, stopAfterFailures, activeProfile, trackingEnabled, 
-                campaignName, targetHtmlField, startingRowNumber, appendAccountName, accountIndex, multilineFields, 
-                moduleApiName: specificModule 
-            } = payloadData;
+            const { selectedProfileName, bulkField, bulkData, staticData, delay, stopAfterFailures, activeProfile, trackingEnabled, campaignName, targetHtmlField, startingRowNumber, appendAccountName, accountIndex, multilineFields, moduleApiName: specificModule } = payloadData;
 
-            // 🚨 ISOLATION PREFIX: inv_
             const masterJobType = `inv_${masterJobTypeRaw}`;
             const queueName = `${masterJobType}Queue_${selectedProfileName}`;
             const accountQueue = new Queue(queueName, { connection });
@@ -137,13 +125,7 @@ const handleStartMasterBatch = async (socket, data) => {
 
                 return { 
                     name: 'processModule', 
-                    data: { 
-                        rowData: payload, identifier, 
-                        moduleApiName: masterJobType, 
-                        actualTargetModule: specificModule,
-                        selectedProfileName, delay, activeProfile, rowNumber: baseRowNumber + index, trackingEnabled, 
-                        campaignName, targetHtmlField, appendAccountName, accountIndex, multilineFields
-                    }, 
+                    data: { rowData: payload, identifier, moduleApiName: masterJobType, actualTargetModule: specificModule, selectedProfileName, delay, activeProfile, rowNumber: baseRowNumber + index, trackingEnabled, campaignName, targetHtmlField, appendAccountName, accountIndex, multilineFields }, 
                     opts: { removeOnComplete: true, removeOnFail: true } 
                 };
             });
