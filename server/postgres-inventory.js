@@ -44,7 +44,7 @@ const initDB = async () => {
                 timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         `);
-        console.log("cyanBold", "🔵 Inventory PostgreSQL Database Initialized.");
+        console.log("🔵 Inventory PostgreSQL Database Initialized.");
     } catch (err) {
         console.error("❌ [DB ERROR] Failed to initialize Inventory PostgreSQL:", err.message);
     }

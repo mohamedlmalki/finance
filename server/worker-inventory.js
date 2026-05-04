@@ -106,7 +106,8 @@ const processZohoJob = async (job) => {
         let payloadToSubmit = { ...rowData };
 
         if (trackingEnabled && targetHtmlField && payloadToSubmit[targetHtmlField]) {
-            payloadToSubmit[targetHtmlField] = await injectBase64Tracking(payloadToSubmit[targetHtmlField], identifier, selectedProfileName, activeProfile.inventory || {}, campaignName);
+            // 🛠️ THE FIX: Pass activeProfile directly to find cloudflareTrackingUrl at the root!
+            payloadToSubmit[targetHtmlField] = await injectBase64Tracking(payloadToSubmit[targetHtmlField], identifier, selectedProfileName, activeProfile, campaignName);
         }
 
         if (appendAccountName && multilineFields && multilineFields.length > 0) {

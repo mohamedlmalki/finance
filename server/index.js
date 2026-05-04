@@ -360,26 +360,32 @@ io.on('connection', (socket) => {
                 const targetDb = currentJobType.startsWith('bil_') ? billingDb : (currentJobType.startsWith('inv_') ? inventoryDb : db);
                 const targetDbName = currentJobType.startsWith('bil_') ? 'BILLING DB' : (currentJobType.startsWith('inv_') ? 'INVENTORY DB' : 'MAIN DB');
 
-                console.log(`\n  ${cliColors.gray}➤ Target Sub-Module: ${currentJobType}${cliColors.reset}`);
+                console.log(`\n${cliColors.yellowBold}=================================================${cliColors.reset}`);
+                console.log(`${cliColors.yellowBold}☢️ [WIPE PROTOCOL INITIATED] Target Module: ${currentJobType}${cliColors.reset}`);
                 
                 const pauseSql = `UPDATE jobs SET status = 'ended' WHERE jobtype = '${currentJobType}'`;
-                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${pauseSql}${cliColors.reset}`);
+                console.log(`  ${cliColors.gray}➤ [SQL COMMAND to ${targetDbName}] ${pauseSql}${cliColors.reset}`);
                 await targetDb.query("UPDATE jobs SET status = 'ended' WHERE jobtype = $1", [currentJobType]);
                 
                 await new Promise(r => setTimeout(r, 500)); 
                 
+                let currentVaporized = 0;
+                let currentDeletedJobs = 0;
+                let currentDeletedResults = 0;
+
                 if (currentJobType.startsWith('Flow_')) {
                     const profiles = readProfiles();
-                    profiles.forEach(p => {
-                        if (flowHandler.killClock) flowHandler.killClock(`Flow_${p.profileName}_${p.profileName}`);
-                    });
-                    console.log(`  ${cliColors.yellowBold}➤ [SYSTEM COMMAND] Terminated all Flow clocks for ${currentJobType}${cliColors.reset}`);
+                    for (const p of profiles) { // Changed to standard for loop to allow await
+                        if (flowHandler.killClock) {
+                            await flowHandler.killClock(`Flow_${p.profileName}_${p.profileName}`);
+                        }
+                    }
+                    console.log(`  ${cliColors.gray}➤ [SYSTEM COMMAND] Terminated all Flow clocks for ${currentJobType}${cliColors.reset}`);
                 } else {
                     socket.emit('wipeProgress', { jobType, message: `Obliterating BullMQ Redis Queues for ${currentJobType}...` });
                     const { Queue } = require('bullmq');
                     const { connection } = require('./worker');
                     
-                    console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] connection.keys('bull:${currentJobType}Queue_*:meta')${cliColors.reset}`);
                     const metaKeys = await connection.keys(`bull:${currentJobType}Queue_*:meta`);
                     
                     if (metaKeys.length > 0) {
@@ -387,16 +393,19 @@ io.on('connection', (socket) => {
                             const queueName = metaKey.replace('bull:', '').replace(':meta', '');
                             const q = new Queue(queueName, { connection });
                             try {
-                                console.log(`  ${cliColors.yellowBold}➤ [REDIS COMMAND] BullMQ.obliterate() on '${queueName}'${cliColors.reset}`);
+                                console.log(`  ${cliColors.gray}➤ [REDIS COMMAND] targetQueue.pause() on '${queueName}'${cliColors.reset}`);
                                 await q.pause(); 
+                                console.log(`  ${cliColors.gray}➤ [REDIS COMMAND] targetQueue.obliterate({ force: true }) on '${queueName}'${cliColors.reset}`);
                                 await q.obliterate({ force: true }); 
                                 vaporizedCount++;
+                                currentVaporized++;
                             } catch (e) {
                                 console.log(`  ${cliColors.gray}➤ [REDIS FALLBACK] connection.del() on all keys matching 'bull:${queueName}:*'${cliColors.reset}`);
                                 const rawKeys = await connection.keys(`bull:${queueName}:*`);
                                 if (rawKeys.length > 0) {
                                     await connection.del(...rawKeys);
                                     vaporizedCount++;
+                                    currentVaporized++;
                                 }
                             } finally {
                                 await q.close();
@@ -411,14 +420,29 @@ io.on('connection', (socket) => {
                 await new Promise(r => setTimeout(r, 500));
 
                 const countSql = `SELECT COUNT(*) FROM job_results WHERE jobId LIKE '${currentJobType}_%'`;
-                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${countSql}${cliColors.reset}`);
+                console.log(`  ${cliColors.gray}➤ [SQL COMMAND to ${targetDbName}] ${countSql}${cliColors.reset}`);
                 const countRes = await targetDb.query("SELECT COUNT(*) FROM job_results WHERE jobId LIKE $1", [`${currentJobType}_%`]);
-                deletedResultsCount += parseInt(countRes.rows[0].count) || 0;
-
+                
                 const deleteSql = `DELETE FROM jobs WHERE jobtype = '${currentJobType}'`;
-                console.log(`  ${cliColors.yellowBold}➤ [SQL COMMAND to ${targetDbName}] ${deleteSql} (Triggers CASCADE)${cliColors.reset}`);
+                console.log(`  ${cliColors.gray}➤ [SQL COMMAND to ${targetDbName}] ${deleteSql} (Triggers CASCADE)${cliColors.reset}`);
                 const delRes = await targetDb.query("DELETE FROM jobs WHERE jobtype = $1", [currentJobType]);
-                deletedJobsCount += delRes.rowCount;
+                
+                currentDeletedResults = parseInt(countRes.rows[0].count) || 0;
+                currentDeletedJobs = delRes.rowCount;
+
+                deletedResultsCount += currentDeletedResults;
+                deletedJobsCount += currentDeletedJobs;
+
+                console.log(`\n${cliColors.redBold}🟥 [NUCLEAR ACCOUNT WIPE EXECUTED] Target: ${currentJobType}${cliColors.reset}`);
+                console.log(`${cliColors.redBold}=================================================${cliColors.reset}`);
+                console.log(`✅ Redis Queues Vaporized: ${currentVaporized}`);
+                console.log(`✅ Postgres Jobs Deleted: ${currentDeletedJobs}`);
+                console.log(`✅ Postgres Results Deleted: ${currentDeletedResults} (Cascade)`);
+                console.log(`${cliColors.redBold}=================================================${cliColors.reset}\n`);
+                
+                // 🔥 THE FIX: Tell Node.js to wait for 1 second before wiping the next module
+                // This ensures the logs print beautifully one by one without getting mixed up!
+                await new Promise(resolve => setTimeout(resolve, 1000));
             }
 
             console.log(`\n${cliColors.redBold}🟥 [NUCLEAR MASTER WIPE EXECUTED] Target: ${jobType}${cliColors.reset}`);

@@ -1,4 +1,4 @@
-// --- FILE: server/postgres.js ---
+// --- FILE: server/postgres.js --- FLOW DATABASE
 const { Pool } = require('pg');
 
 // Connect to your local or hosted PostgreSQL database

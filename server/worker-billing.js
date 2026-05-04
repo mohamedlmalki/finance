@@ -131,7 +131,7 @@ const processZohoJob = async (job) => {
 
         if (trackingEnabled && targetHtmlField && payloadToSubmit[targetHtmlField]) {
             const config = serviceType === 'billing' ? (activeProfile.billing || {}) : (activeProfile.inventory || {});
-            payloadToSubmit[targetHtmlField] = await injectBase64Tracking(payloadToSubmit[targetHtmlField], identifier, selectedProfileName, config, campaignName, serviceType);
+		    payloadToSubmit[targetHtmlField] = await injectBase64Tracking(payloadToSubmit[targetHtmlField], identifier, selectedProfileName, activeProfile, campaignName, serviceType);
         }
 
         if (appendAccountName && multilineFields && multilineFields.length > 0) {

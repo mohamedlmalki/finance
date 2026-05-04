@@ -124,8 +124,8 @@ const processFlowJob = async (job) => {
     }
 
     if (trackingEnabled && targetHtmlField && rawPayload[targetHtmlField]) {
-        const cfg = activeProfile.flow || activeProfile.inventory || {}; 
-        rawPayload[targetHtmlField] = await injectFlowTracking(rawPayload[targetHtmlField], identifier, selectedProfileName, cfg);
+        // FIX: Pass the entire activeProfile so it can find cloudflareTrackingUrl at the root level
+        rawPayload[targetHtmlField] = await injectFlowTracking(rawPayload[targetHtmlField], identifier, selectedProfileName, activeProfile);
     }
 
     const finalPayload = {

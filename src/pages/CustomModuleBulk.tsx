@@ -195,13 +195,14 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
 
                         grouped[profileName].forEach(result => {
                             const existingIndex = newResults.findIndex(r => r.rowNumber === result.rowNumber);
+                            
+                            // 🛠️ THE FIX: Trust the 1-second buffer to count smoothly!
                             if (result.stage === 'complete') {
-                                if (existingIndex === -1 || newResults[existingIndex].stage !== 'complete') {
-                                    newProcessed++;
-                                    if (result.success) newSuccess++;
-                                    else newError++;
-                                }
+                                newProcessed++;
+                                if (result.success) newSuccess++;
+                                else newError++;
                             }
+                            
                             if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...result };
                             else newResults.unshift(result);
                         });
@@ -275,9 +276,11 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                 });
 
                 allJobs.forEach(dbJob => {
-                    if (!dbJob.jobType || !dbJob.jobType.startsWith('inv_')) return;
+                    // 🛠️ THE FIX: Check both casing styles from Postgres!
+                    const jt = dbJob.jobType || dbJob.jobtype;
+                    if (!jt || !jt.startsWith('inv_')) return;
                     
-                    const rawModule = dbJob.jobType.replace(/^inv_/, '');
+                    const rawModule = jt.replace(/^inv_/, '');
                     const profileName = dbJob.profileName || dbJob.profilename;
                     if (!profileName) return;
 
@@ -289,7 +292,6 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                         if ((existingJob as any)._isQueued) return; 
                         if (existingJob.isProcessing && (existingJob as any)._ignition === false) return; 
                         
-                        // 🚨 THE FIX: Force strict Number parsing to fix broken counters!
                         const dbProcessed = parseInt(dbJob.processedCount || dbJob.processedcount || '0', 10);
                         const dbSuccess = parseInt(dbJob.successCount || dbJob.successcount || '0', 10);
                         const dbError = parseInt(dbJob.errorCount || dbJob.errorcount || '0', 10);
@@ -329,11 +331,33 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                             mergedResults = mergedResults.slice(0, MAX_BUFFER_SIZE);
                         }
 
-                        let finalProcessingStartTime = dbJob.processingstarttime ? new Date(dbJob.processingstarttime) : existingJob.processingStartTime;
-                        let processingTime = existingJob.processingTime || 0;
+                        // 🔥 PERFECT SYNC: RECOVER ALL FORM DATA FROM POSTGRES DB
+                        let restoredFormData = existingJob.formData;
+                        if (dbJob.formdata || dbJob.formData) {
+                            let parsed = dbJob.formdata || dbJob.formData;
+                            if (typeof parsed === 'string') {
+                                try { parsed = JSON.parse(parsed); } catch(e){}
+                            }
+                            if (parsed && typeof parsed === 'object') {
+                                restoredFormData = { ...existingJob.formData, ...parsed, moduleApiName: validModule };
+                            }
+                        } else {
+                            restoredFormData = { ...existingJob.formData, moduleApiName: validModule };
+                        }
 
-                        if (processingTime === 0 && newProcessedSafe > 0 && backendIsProcessing) {
-                            processingTime = Math.floor(newProcessedSafe * ((existingJob.formData?.delay || 0) + 1.5));
+                        // 🔥 PERFECT SYNC: RECOVER EXACT ELAPSED TIME (WITH TIMEZONE FIX)
+                        let currentProcessingTime = existingJob.processingTime || 0;
+                        let startTime = dbJob.processingstarttime || dbJob.processingStartTime;
+                        
+                        if (currentProcessingTime === 0 && startTime && backendIsProcessing && !backendIsPaused) {
+                            const startTimestamp = new Date(startTime).getTime();
+                            let elapsedSeconds = Math.floor((Date.now() - startTimestamp) / 1000);
+                            
+                            const offsetSeconds = new Date().getTimezoneOffset() * 60;
+                            elapsedSeconds += offsetSeconds;
+                            
+                            if (elapsedSeconds < 0) elapsedSeconds = 0;
+                            currentProcessingTime = elapsedSeconds;
                         }
 
                         if (
@@ -346,7 +370,7 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                         ) {
                             next[profileName] = {
                                 ...existingJob,
-                                formData: { ...existingJob.formData, moduleApiName: validModule },
+                                formData: restoredFormData,             // RESTORES UI INPUTS
                                 isProcessing: backendIsProcessing,
                                 isPaused: backendIsPaused,
                                 _isQueued: backendIsQueued, 
@@ -357,8 +381,8 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
                                 processedCount: newProcessedSafe,
                                 successCount: newSuccessSafe,
                                 errorCount: newErrorSafe,
-                                processingStartTime: finalProcessingStartTime,
-                                processingTime: processingTime
+                                processingStartTime: startTime ? new Date(startTime) : existingJob.processingStartTime,
+                                processingTime: currentProcessingTime   // RESTORES TIMER
                             };
                             hasChanges = true;
                         }
@@ -676,7 +700,27 @@ const CustomModuleBulk: React.FC<CustomModuleBulkProps> = ({
     };
 
     const handleClearJob = () => { if (!activeProfileName || !formData.moduleApiName || !socket) return; if (window.confirm(`⚠️ Are you sure you want to completely WIPE all data for ${activeProfileName}?`)) { socket.emit('clearJob', { profileName: activeProfileName, jobType: `inv_${formData.moduleApiName}` }); } };
-    const handleClearAllJobs = () => { if (!formData.moduleApiName || !socket) return; if (window.confirm(`🚨 DANGER: Are you sure you want to completely WIPE ALL databases for EVERY profile on module ${formData.moduleApiName}?`)) { socket.emit('clearAllJobs', { jobType: `inv_${formData.moduleApiName}` }); } };
+    const handleClearAllJobs = () => { 
+        if (!socket) return; 
+        if (window.confirm(`🚨 DANGER: Are you sure you want to completely WIPE ALL databases for EVERY profile on Inventory Custom Modules?`)) { 
+            
+            // 🛠️ THE FIX: Emit the true Nuclear Master Wipe command
+            socket.emit('clearAllJobs', { jobType: 'inv_MASTER_WIPE' }); 
+            
+            setJobs(prev => {
+                const next = { ...prev };
+                Object.keys(next).forEach(profile => {
+                    next[profile] = { 
+                        ...next[profile], results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, 
+                        formData: { ...next[profile].formData, bulkData: '' }, processedCount: 0, successCount: 0, errorCount: 0, 
+                        _forceStopped: true, _isQueued: false 
+                    } as any;
+                });
+                return next;
+            });
+            toast({ title: "Master Wipe Initiated", description: "All Inventory Custom Modules are being obliterated." });
+        } 
+    };
 
     const jobStateRaw = (activeProfileName && jobs[activeProfileName]) ? jobs[activeProfileName] : createInitialJobState();
     const jobState = { ...jobStateRaw, formData: { ...jobStateRaw.formData } };

@@ -5,10 +5,9 @@
   "type": "module",
   "scripts": {
     "setup": "npm install && npm install --prefix server",
-    "dev": "concurrently \"npm run dev:client\" \"npm run dev:api\" \"npm run dev:worker\"",
+    "dev": "concurrently \"npm run dev:client\" \"npm run dev:api\"",
     "dev:client": "vite",
     "dev:api": "cd server && node index.js",
-    "dev:worker": "cd server && node worker-app.js",
     "build": "vite build",
     "build:dev": "vite build --mode development",
     "lint": "eslint .",

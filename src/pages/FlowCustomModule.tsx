@@ -310,6 +310,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                     if (!dbJob.jobtype?.startsWith('Flow_') && !dbJob.jobType?.startsWith('Flow_')) return;
                     const profileName = dbJob.profilename || dbJob.profileName;
                     const existingJob = getSafeJob(next, profileName);
+                    
                     if ((existingJob as any)._isQueued || (existingJob.isProcessing && (existingJob as any)._ignition === false)) return;
                     
                     const newProcessed = Math.max(existingJob.processedCount || 0, dbJob.processedCount || dbJob.processedcount || 0);
@@ -318,17 +319,22 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                     const newTotal = dbJob.totalToProcess || dbJob.totaltoprocess || existingJob.totalToProcess || 0;
                     const isDone = newProcessed >= newTotal && newTotal > 0;
                     
-                    let backendIsProcessing = false; let backendIsQueued = false; let backendIsPaused = dbJob.status === 'paused';
+                    let backendIsProcessing = false; 
+                    let backendIsQueued = false; 
+                    let backendIsPaused = dbJob.status === 'paused' || dbJob.status === 'paused_queued';
+                    
                     if (existingJob.isPaused && dbJob.status === 'running') { backendIsPaused = true; }
+                    
                     if (!isDone) {
                         if (backendIsPaused) { backendIsProcessing = true; }
                         else if (dbJob.status === 'running') { backendIsProcessing = true; }
                         else if (dbJob.status === 'queued') { backendIsQueued = true; }
                     }
                     if ((existingJob as any)._forceStopped) { backendIsProcessing = false; backendIsPaused = false; } 
+                    
                     let mergedResults = [...(existingJob.results || [])];
                     if (dbJob.results && Array.isArray(dbJob.results)) {
-                        dbJob.results.forEach(dbResult => {
+                        dbJob.results.forEach((dbResult: any) => {
                             const idx = mergedResults.findIndex(r => r.rowNumber === dbResult.rowNumber);
                             let formatStage = 'complete';
                             if (dbResult.success === null) formatStage = 'waiting';
@@ -339,14 +345,67 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                         mergedResults.sort((a, b) => { const numA = a.rowNumber || a.fallbackRowNumber || 0; const numB = b.rowNumber || b.fallbackRowNumber || 0; return numB - numA; });
                         mergedResults = mergedResults.slice(0, MAX_BUFFER_SIZE);
                     }
-                    if ( existingJob.processedCount !== newProcessed || existingJob.totalToProcess !== newTotal || existingJob.isProcessing !== backendIsProcessing || existingJob.isPaused !== backendIsPaused ) {
-                        next[profileName] = { ...existingJob, isProcessing: backendIsProcessing, isPaused: backendIsPaused, _isQueued: backendIsQueued, isComplete: isDone, totalToProcess: newTotal, processedCount: newProcessed, successCount: newSuccess, errorCount: newError, results: mergedResults } as any;
+                    
+                    // 🔥 1. PERFECT SYNC: RECOVER ALL FORM DATA FROM POSTGRES DB
+                    let restoredFormData = existingJob.formData;
+                    if (dbJob.formdata || dbJob.formData) {
+                        let parsed = dbJob.formdata || dbJob.formData;
+                        if (typeof parsed === 'string') {
+                            try { parsed = JSON.parse(parsed); } catch(e){}
+                        }
+                        if (parsed && typeof parsed === 'object') {
+                            restoredFormData = { ...existingJob.formData, ...parsed };
+                        }
+                    }
+
+                    // 🔥 2. PERFECT SYNC: RECOVER EXACT ELAPSED TIME (WITH TIMEZONE FIX)
+                    let currentProcessingTime = existingJob.processingTime || 0;
+                    let startTime = dbJob.processingstarttime || dbJob.processingStartTime;
+                    
+                    // Only recalculate if the timer is at 0 (e.g. you just refreshed the page)
+                    if (currentProcessingTime === 0 && startTime && backendIsProcessing && !backendIsPaused) {
+                        const startTimestamp = new Date(startTime).getTime();
+                        let elapsedSeconds = Math.floor((Date.now() - startTimestamp) / 1000);
+                        
+                        // 🛠️ THE BUG FIX: Neutralize Postgres Naive Timezone Shift
+                        // Postgres naive timestamps shift by the local timezone offset (Morocco = +60 mins).
+                        // We reverse this mathematically so it doesn't add a random 60 minutes!
+                        const offsetSeconds = new Date().getTimezoneOffset() * 60;
+                        elapsedSeconds += offsetSeconds;
+                        
+                        if (elapsedSeconds < 0) elapsedSeconds = 0;
+                        currentProcessingTime = elapsedSeconds;
+                    }
+
+                    // 🔥 3. SMART UPDATE TRIGGER
+                    const hasMissingData = (existingJob.totalToProcess === 0 && newTotal > 0);
+                    const hasCountMismatch = existingJob.processedCount !== newProcessed || existingJob.totalToProcess !== newTotal;
+                    const hasStateMismatch = existingJob.isProcessing !== backendIsProcessing || existingJob.isPaused !== backendIsPaused;
+                    const hasTimeMismatch = Math.abs((existingJob.processingTime || 0) - currentProcessingTime) > 5;
+
+                    if (hasCountMismatch || hasStateMismatch || hasMissingData || hasTimeMismatch) {
+                        next[profileName] = { 
+                            ...existingJob, 
+                            isProcessing: backendIsProcessing, 
+                            isPaused: backendIsPaused, 
+                            _isQueued: backendIsQueued, 
+                            isComplete: isDone, 
+                            totalToProcess: newTotal, 
+                            processedCount: newProcessed, 
+                            successCount: newSuccess, 
+                            errorCount: newError, 
+                            results: mergedResults,
+                            formData: restoredFormData,             // RESTORES UI INPUTS
+                            processingTime: currentProcessingTime,  // RESTORES TIMER
+                            processingStartTime: startTime ? new Date(startTime) : existingJob.processingStartTime
+                        } as any;
                         hasChanges = true;
                     }
                 });
                 return hasChanges ? next : prev;
             });
         };
+		
         const handleJobStarted = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: true, _isQueued: false, _forceStopped: false, isPaused: false } as any })); };
         const handleBulkComplete = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: false, isComplete: true } as any })); };
         const handleBulkEnded = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: false, _forceStopped: true } as any })); };
