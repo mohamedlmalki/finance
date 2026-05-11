@@ -29,7 +29,10 @@ require('dotenv').config();
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: "*" } }); 
+const io = new Server(server, { 
+    cors: { origin: "*" },
+    maxHttpBufferSize: 1e8 // Allows payloads up to 100MB
+});
 
 // 🚀 START ISOLATED WORKERS AUTOMATICALLY
 try { require('./worker-billing.js'); } catch (e) {}
@@ -278,8 +281,8 @@ io.on('connection', (socket) => {
 
             if (jobType.startsWith('Flow_')) {
                 const jobId = `${jobType}_${profileName}`;
-                if (flowHandler.killClock) flowHandler.killClock(jobId);
-                console.log(`  ${cliColors.yellowBold}➤ [SYSTEM COMMAND] flowHandler.killClock('${jobId}')${cliColors.reset}`);
+                if (flowHandler.killClock) flowHandler.killClock(profileName); // 👈 CHANGE THIS LINE
+                console.log(`  ${cliColors.yellowBold}➤ [SYSTEM COMMAND] flowHandler.killClock('${profileName}')${cliColors.reset}`); // 👈 CHANGE THIS LINE
             } else {
                 socket.emit('wipeProgress', { profileName, jobType, message: `Obliterating Redis Queues...` });
                 const { Queue } = require('bullmq');
@@ -375,9 +378,9 @@ io.on('connection', (socket) => {
 
                 if (currentJobType.startsWith('Flow_')) {
                     const profiles = readProfiles();
-                    for (const p of profiles) { // Changed to standard for loop to allow await
+                    for (const p of profiles) { 
                         if (flowHandler.killClock) {
-                            await flowHandler.killClock(`Flow_${p.profileName}_${p.profileName}`);
+                            await flowHandler.killClock(p.profileName); // 👈 CHANGE THIS LINE
                         }
                     }
                     console.log(`  ${cliColors.gray}➤ [SYSTEM COMMAND] Terminated all Flow clocks for ${currentJobType}${cliColors.reset}`);
@@ -465,27 +468,32 @@ io.on('connection', (socket) => {
         try {
             const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
 
-            const jobRecord = await targetDb.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-            if (jobRecord.rows.length === 0) return;
-            const currentStatus = jobRecord.rows[0].status;
-            let isQueued = false;
+            // 🔥 THE FIX: Atomic Status Switch prevents Race Conditions
+            const updateRes = await targetDb.query(`
+                UPDATE jobs 
+                SET status = CASE 
+                    WHEN status = 'queued' THEN 'paused_queued' 
+                    WHEN status = 'running' THEN 'paused' 
+                    ELSE status 
+                END 
+                WHERE profilename = $1 AND jobtype = $2 
+                RETURNING status
+            `, [profileName, jobType]);
 
-            if (currentStatus === 'queued') {
-                await targetDb.query("UPDATE jobs SET status = 'paused_queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-                isQueued = true;
-            } else if (currentStatus === 'running') {
-                await targetDb.query("UPDATE jobs SET status = 'paused' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-                
-                if (!jobType.startsWith('Flow_')) {
-                    try {
-                        const { Queue } = require('bullmq'); const { connection } = require('./worker');
-                        const accountQueue = new Queue(`${jobType}Queue_${profileName}`, { connection });
-                        await accountQueue.pause(); await accountQueue.close(); 
-                    } catch(e) {}
-                }
-                isQueued = false;
+            if (updateRes.rows.length === 0) return;
+            const newStatus = updateRes.rows[0].status;
+
+            if (newStatus === 'paused' && !jobType.startsWith('Flow_')) {
+                try {
+                    const { Queue } = require('bullmq'); const { connection } = require('./worker');
+                    const accountQueue = new Queue(`${jobType}Queue_${profileName}`, { connection });
+                    await accountQueue.pause(); await accountQueue.close(); 
+                } catch(e) {}
             }
-            socket.emit('jobPaused', { profileName, jobType, reason: 'Paused by user', isQueued });
+            
+            if (newStatus === 'paused' || newStatus === 'paused_queued') {
+                socket.emit('jobPaused', { profileName, jobType, reason: 'Paused by user', isQueued: newStatus === 'paused_queued' });
+            }
         } catch (error) {}
     });
 
@@ -493,27 +501,32 @@ io.on('connection', (socket) => {
         try {
             const targetDb = jobType.startsWith('bil_') ? billingDb : (jobType.startsWith('inv_') ? inventoryDb : db);
 
-            const jobRecord = await targetDb.query("SELECT status FROM jobs WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-            if (jobRecord.rows.length === 0) return;
-            const currentStatus = jobRecord.rows[0].status;
-            let isQueued = false;
+            // 🔥 THE FIX: Atomic Status Switch
+            const updateRes = await targetDb.query(`
+                UPDATE jobs 
+                SET status = CASE 
+                    WHEN status = 'paused_queued' THEN 'queued' 
+                    WHEN status = 'paused' THEN 'running' 
+                    ELSE status 
+                END 
+                WHERE profilename = $1 AND jobtype = $2 
+                RETURNING status
+            `, [profileName, jobType]);
 
-            if (currentStatus === 'paused_queued') {
-                await targetDb.query("UPDATE jobs SET status = 'queued' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-                isQueued = true;
-            } else if (currentStatus === 'paused') {
-                await targetDb.query("UPDATE jobs SET status = 'running' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
-                
-                if (!jobType.startsWith('Flow_')) {
-                    try {
-                        const { Queue } = require('bullmq'); const { connection } = require('./worker');
-                        const accountQueue = new Queue(`${jobType}Queue_${profileName}`, { connection });
-                        await accountQueue.resume(); await accountQueue.close(); 
-                    } catch(e) {}
-                }
-                isQueued = false;
+            if (updateRes.rows.length === 0) return;
+            const newStatus = updateRes.rows[0].status;
+
+            if (newStatus === 'running' && !jobType.startsWith('Flow_')) {
+                try {
+                    const { Queue } = require('bullmq'); const { connection } = require('./worker');
+                    const accountQueue = new Queue(`${jobType}Queue_${profileName}`, { connection });
+                    await accountQueue.resume(); await accountQueue.close(); 
+                } catch(e) {}
             }
-            socket.emit('jobResumed', { profileName, jobType, isQueued });
+            
+            if (newStatus === 'running' || newStatus === 'queued') {
+                socket.emit('jobResumed', { profileName, jobType, isQueued: newStatus === 'queued' });
+            }
         } catch (error) {}
     });
 
@@ -524,7 +537,7 @@ io.on('connection', (socket) => {
             await targetDb.query("UPDATE jobs SET status = 'ended' WHERE profilename = $1 AND jobtype = $2", [profileName, jobType]);
             if (jobType.startsWith('Flow_')) {
                 const jobId = `${jobType}_${profileName}`;
-                if (flowHandler.killClock) flowHandler.killClock(jobId);
+                if (flowHandler.killClock) flowHandler.killClock(profileName); // 👈 CHANGE THIS LINE
             } else {
                 try {
                     const { Queue } = require('bullmq'); const { connection } = require('./worker');

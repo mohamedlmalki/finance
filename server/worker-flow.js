@@ -2,6 +2,13 @@
 require('dotenv').config();
 const { Worker, Queue } = require('bullmq'); 
 const axios = require('axios'); 
+
+const http = require('http');   // <--- ADD THIS
+const https = require('https'); // <--- ADD THIS
+// The Enterprise Connection Pool (Fixes the "not defined" error)
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60000 });
+
 const db = require('./postgres'); // Flow uses the main Database
 const { emitToWeb } = require('./redis-pubsub');
 const { cliColors } = require('./utils');
@@ -70,17 +77,26 @@ async function injectFlowTracking(html, email, selectedProfileName, config) {
     const workerUrlRegex = /(https?:\/\/[^\s'\"<>]+workers\.dev[^\s'\"<>]*)/gi;
     let uniqueLinks = [...new Set(newText.match(workerUrlRegex) || [])];
 
+    // 🔒 SECURE ENVELOPE: Pack and scramble the tracking data
+    const trackingData = { 
+        e: email, 
+        p: selectedProfileName + '_Flow', 
+        t: selectedProfileName 
+    };
+    const encodedData = Buffer.from(JSON.stringify(trackingData)).toString('base64');
+
     for (let rawUrl of uniqueLinks) {
         if (rawUrl.match(/\.(png|jpg|jpeg|gif|webp|svg)(?:[?#].*)?$/i) || rawUrl.includes('track.gif')) continue;
-        if (!rawUrl.includes('?email=') && !rawUrl.includes('&email=')) {
+        // Check if it already has the data param to avoid double-injecting
+        if (!rawUrl.includes('?data=') && !rawUrl.includes('&data=')) {
             const separator = rawUrl.includes('?') ? '&' : '?';
-            newText = newText.split(rawUrl).join(`${rawUrl}${separator}email=${encodeURIComponent(email)}&profile=${encodeURIComponent(selectedProfileName + '_Flow')}&ticketId=${encodeURIComponent(selectedProfileName)}`);
+            newText = newText.split(rawUrl).join(`${rawUrl}${separator}data=${encodedData}`);
         }
     }
 
     if (config && config.cloudflareTrackingUrl) {
         const baseUrl = config.cloudflareTrackingUrl.replace(/\/$/, '').trim();
-        newText += `\n<img src="${baseUrl}/track.gif?email=${encodeURIComponent(email)}&ticketId=${encodeURIComponent(selectedProfileName)}&profile=${encodeURIComponent(selectedProfileName + '_Flow')}" width="1" height="1" alt="" style="display:none;" />`;
+        newText += `\n<img src="${baseUrl}/track.gif?data=${encodedData}" width="1" height="1" alt="" style="display:none;" />`;
     }
     return newText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 }
@@ -113,7 +129,7 @@ const processFlowJob = async (job) => {
     const rawPayload = { ...staticData, ...rowData };
 
     if (appendAccountName && accountIndex) {
-        const brString = "<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>";
+        const brString = "<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>";
         const appendStr = brString + accountIndex;
         if (rawPayload.description !== undefined && rawPayload.description !== null) {
             rawPayload.description = String(rawPayload.description).replace(/(<br>){5,}\d*$/g, '');
@@ -148,7 +164,12 @@ const processFlowJob = async (job) => {
     let fullResponse = null;
 
     try {
-        const response = await axios.post(webhookUrl.trim(), finalPayload, { headers: { 'Content-Type': 'application/json' } });
+        const response = await axios.post(webhookUrl.trim(), finalPayload, { 
+            headers: { 'Content-Type': 'application/json' },
+            httpAgent,           // Recycle HTTP connections
+            httpsAgent,          // Recycle HTTPS connections
+            timeout: 30000       // Wait max 30 seconds before timing out
+        });
         fullResponse = typeof response.data === 'string' && response.data.length > 1000 ? response.data.substring(0, 1000) + '... [TRUNCATED]' : response.data;
         
         if (useStrictCallback && workerUrl) {
@@ -258,7 +279,10 @@ setInterval(async () => {
 
         // 🚨 FIX: Removed isGlobalFreeze to enforce concurrency!
         let runningCount = 0;
-        sortedJobs.forEach(j => { if (j.status === 'running') runningCount++; });
+        // MUST count paused jobs too, because they are frozen in memory and holding their concurrency slot!
+        sortedJobs.forEach(j => { if (j.status === 'running' || j.status === 'paused') runningCount++; });
+		
+		
 
         for (const dbJob of sortedJobs) {
             let queueName = `FlowQueue_${dbJob.profilename}`;
@@ -267,7 +291,12 @@ setInterval(async () => {
             if (dbJob.status === 'queued') {
                 if (runningCount >= masterLimit) continue; 
                 
-                await db.query("UPDATE jobs SET status = 'running' WHERE id = $1", [dbJob.id]);
+                // 🔥 THE FIX: Atomic lock! It will ONLY update to running if it wasn't just paused by the user!
+                const updateRes = await db.query("UPDATE jobs SET status = 'running' WHERE id = $1 AND status = 'queued' RETURNING id", [dbJob.id]);
+                
+                // If it fails, it means the user clicked Pause a millisecond before this ran. Skip it!
+                if (updateRes.rowCount === 0) continue; 
+                
                 emitToWeb('jobStarted', { profileName: dbJob.profilename, jobType: dbJob.jobtype });
                 
                 dbJob.status = 'running'; 

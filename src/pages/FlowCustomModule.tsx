@@ -585,9 +585,52 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         socket?.emit('startMasterBatchFlowJob', { concurrency: masterBatchConcurrency, payloads }); toast({ title: "Master Batch Started" });
     };
 
-    const handleMasterPauseAll = () => { flowProfiles.forEach(p => { const job = jobs[p.profileName]; if (job && job.isProcessing && !job.isPaused) { setJobs(prev => ({ ...prev, [p.profileName]: { ...getSafeJob(prev, p.profileName), isPaused: true } as any })); socket?.emit('pauseJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` }); } }); toast({ title: "Master Batch Paused" }); };
-    const handleMasterForceResume = () => { flowProfiles.forEach(p => { const job = jobs[p.profileName]; if (job && job.isProcessing && job.isPaused) { setJobs(prev => ({ ...prev, [p.profileName]: { ...getSafeJob(prev, p.profileName), isPaused: false } as any })); socket?.emit('resumeJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` }); } }); toast({ title: "Master Batch Resumed" }); };
-    const handleMasterStopAll = () => { flowProfiles.forEach(p => { const job = jobs[p.profileName]; if (job && (job.isProcessing || (job as any)?._isQueued)) { socket?.emit('endJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` }); setJobs(prev => ({ ...prev, [p.profileName]: { ...getSafeJob(prev, p.profileName), isProcessing: false, _forceStopped: true } as any })); } }); toast({ title: "Master Batch Stopped", variant: "destructive" }); };
+    const handleMasterPauseAll = () => {
+        let pausedCount = 0;
+        flowProfiles.forEach(p => {
+            const job = jobs[p.profileName];
+            // Targets jobs that are either running OR queued
+            if (job && ((job.isProcessing && !job.isPaused) || (job as any)?._isQueued)) {
+                setJobs(prev => {
+                    const existing = getSafeJob(prev, p.profileName);
+                    const wasQueued = !!(existing as any)._isQueued;
+                    return { ...prev, [p.profileName]: { ...existing, isPaused: true, isProcessing: !wasQueued, _isQueued: wasQueued, _forcePaused: true } as any };
+                });
+                socket?.emit('pauseJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` });
+                pausedCount++;
+            }
+        });
+        toast({ title: "Master Batch Paused", description: `Paused ${pausedCount} accounts.` });
+    };
+
+    const handleMasterForceResume = () => {
+        let resumedCount = 0;
+        flowProfiles.forEach(p => {
+            const job = jobs[p.profileName];
+            if (job && (job.isPaused || (job as any)?._forcePaused)) {
+                setJobs(prev => {
+                    const existing = getSafeJob(prev, p.profileName);
+                    const isQueued = !!(existing as any)._isQueued;
+                    return { ...prev, [p.profileName]: { ...existing, isPaused: false, isProcessing: !isQueued, _isQueued: isQueued, _forcePaused: false } as any };
+                });
+                socket?.emit('resumeJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` });
+                resumedCount++;
+            }
+        });
+        toast({ title: "Master Batch Resumed", description: `Resumed ${resumedCount} accounts.` });
+    };
+
+    const handleMasterStopAll = () => { 
+        flowProfiles.forEach(p => { 
+            const job = jobs[p.profileName]; 
+            if (job && (job.isProcessing || (job as any)?._isQueued || job.isPaused)) { 
+                socket?.emit('endJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` }); 
+                setJobs(prev => ({ ...prev, [p.profileName]: { ...getSafeJob(prev, p.profileName), isProcessing: false, _forceStopped: true } as any })); 
+            } 
+        }); 
+        toast({ title: "Master Batch Stopped", variant: "destructive" }); 
+    };
+
     const handleRetryFailed = () => { if (!activeProfileName) return; const failed = results.filter(r => !r.success && r.stage === 'complete').map(r => r.identifier).join('\n'); if (!failed) return toast({ title: "No failed items" }); updateFormData({ bulkData: failed }); setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isProcessing: false, totalToProcess: failed.split('\n').length, results: [], processedCount: 0, successCount: 0, errorCount: 0 } as any })); toast({ title: "Ready for Retry" }); };
 
     const completedCount = (jobState as any).processedCount || 0; const successCount = (jobState as any).successCount || 0; const errorCount = (jobState as any).errorCount || 0;

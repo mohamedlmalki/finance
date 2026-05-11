@@ -78,7 +78,15 @@ const spawnQueueProcessor = async (socket, data, isMaster = false) => {
         try { await accountQueue.obliterate({ force: true }); } catch(e) {}
         await accountQueue.resume();
         
-        await accountQueue.addBulk(jobs);
+        // 🚀 THE FIX: Chunk the jobs into batches of 500 to prevent Redis/Node freezing
+        const BATCH_SIZE = 500;
+        for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
+            const batch = jobs.slice(i, i + BATCH_SIZE);
+            await accountQueue.addBulk(batch);
+            
+            // Give the Node.js event loop a 50ms breather between heavy memory inserts
+            await new Promise(resolve => setTimeout(resolve, 50)); 
+        }
 
         if (!isMaster) {
             socket.emit('jobStarted', { profileName: selectedProfileName, jobType: jobType });
@@ -102,8 +110,9 @@ const handleStartBulkFlowJob = async (socket, data) => {
     await spawnQueueProcessor(socket, data, false); 
 };
 
-const killClock = async (jobId) => {
-    const queueName = jobId.replace('Flow_', 'FlowQueue_'); 
+// 🚨 THE FIX: Accept profileName directly to guarantee a perfect queue match
+const killClock = async (profileName) => {
+    const queueName = `FlowQueue_${profileName}`; 
     try {
         const q = new Queue(queueName, { connection });
         await q.pause();
@@ -111,7 +120,6 @@ const killClock = async (jobId) => {
         await q.close();
     } catch(e) {}
 };
-
 const setActiveJobs = () => {}; 
 
 module.exports = { setActiveJobs, handleStartBulkFlowJob, handleStartMasterBatch, killClock };
