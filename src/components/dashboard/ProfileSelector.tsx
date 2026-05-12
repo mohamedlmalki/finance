@@ -16,8 +16,6 @@ type ServiceType = 'inventory' | 'expense' | 'books' | 'billing' | 'flow';
 type LiveCounterState = { current: number, failed: number, isProcessing: boolean, forceStop: boolean };
 
 // 🚨 GLOBAL HIGH WATER MARK CACHE
-// Sits outside the component to completely survive page switches (unmounts).
-// Ensures the UI never drops backwards if the database sync momentarily returns a 0.
 const highWaterMarks: Record<string, { current: number, failed: number }> = {};
 
 interface ProfileSelectorProps {
@@ -68,6 +66,13 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
 
       const handleEnded = (res: any) => {
           if (!res.profileName) return;
+          
+          // 🚀 THE FIX: Force the HighWaterMark to reset when the job explicitly stops!
+          const hwKey = `${service}_${res.profileName}`;
+          if (highWaterMarks[hwKey]) {
+              highWaterMarks[hwKey] = { current: 0, failed: 0 };
+          }
+
           setLiveCounters(prev => ({ 
               ...prev, 
               [res.profileName]: { 
@@ -96,7 +101,6 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
           }));
       };
 
-      // 🚨 ISOLATION MAP: Only listen to the correct service
       const serviceEventMap = [
           { event: 'customModuleResult', expectedService: 'inventory' },
           { event: 'invoiceResult', expectedService: 'inventory' },
@@ -137,6 +141,7 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
       socket.on('bulkEnded', handleEndedWrapper);
       socket.on('bulkComplete', handleEndedWrapper);
       socket.on('jobStarted', handleStartedWrapper);
+      socket.on('jobCleared', handleEndedWrapper); // Clear resets the state too!
 
       return () => {
           activeListeners.forEach(({ event, handler }) => {
@@ -145,6 +150,7 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
           socket.off('bulkEnded', handleEndedWrapper);
           socket.off('bulkComplete', handleEndedWrapper);
           socket.off('jobStarted', handleStartedWrapper);
+          socket.off('jobCleared', handleEndedWrapper);
       };
   }, [socket, service]);
 
@@ -194,7 +200,7 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
   let activeCurrent = 0;
   let activeFailed = 0;
 
-  // 🚨 ACTIVE PROFILE: Apply High Water Mark
+  // 🚨 ACTIVE PROFILE: Apply High Water Mark Safely
   if (activeProfile) {
       const hwKey = `${service}_${activeProfile.profileName}`;
       if (!highWaterMarks[hwKey] || activeTotal === 0) {
@@ -207,12 +213,18 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
       const liveCurrent = activeLive?.current || 0;
       const liveFailed = activeLive?.failed || 0;
 
-      activeCurrent = Math.max(stateCurrent, liveCurrent);
-      activeFailed = Math.max(stateFailed, liveFailed);
+      let current = Math.max(stateCurrent, liveCurrent);
+      let failed = Math.max(stateFailed, liveFailed);
 
-      // Lock it in so it never drops
-      highWaterMarks[hwKey].current = Math.max(highWaterMarks[hwKey].current, activeCurrent);
-      highWaterMarks[hwKey].failed = Math.max(highWaterMarks[hwKey].failed, activeFailed);
+      // 🚀 THE FIX: If the backend actually sends a 0 (because we stopped the job), WE ACCEPT IT AND RESET THE CACHE!
+      if (current === 0 && !activeJob?.isProcessing && !(activeJob as any)?._isQueued) {
+          highWaterMarks[hwKey].current = 0;
+          highWaterMarks[hwKey].failed = 0;
+      } else {
+          // Lock it in so it never drops backward during a live run
+          highWaterMarks[hwKey].current = Math.max(highWaterMarks[hwKey].current, current);
+          highWaterMarks[hwKey].failed = Math.max(highWaterMarks[hwKey].failed, failed);
+      }
 
       activeCurrent = highWaterMarks[hwKey].current;
       activeFailed = highWaterMarks[hwKey].failed;
@@ -308,7 +320,7 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
                         
                         const total = parseInt(job?.totalTicketsToProcess) || parseInt(job?.totalToProcess) || 0;
                         
-                        // 🚨 DROPDOWN LIST: Apply High Water Mark 
+                        // 🚨 DROPDOWN LIST: Apply High Water Mark Safely
                         const hwKey = `${service}_${profile.profileName}`;
                         if (!highWaterMarks[hwKey] || total === 0) {
                             highWaterMarks[hwKey] = { current: 0, failed: 0 };
@@ -323,8 +335,14 @@ export const ProfileSelector: React.FC<ProfileSelectorProps> = ({ profiles, sele
                         let current = Math.max(stateCurrent, liveCurrent);
                         let failedCount = Math.max(stateFailed, liveFailed);
 
-                        highWaterMarks[hwKey].current = Math.max(highWaterMarks[hwKey].current, current);
-                        highWaterMarks[hwKey].failed = Math.max(highWaterMarks[hwKey].failed, failedCount);
+                        // 🚀 THE FIX: Accept explicit 0s when stopped
+                        if (current === 0 && !job?.isProcessing && !(job as any)?._isQueued) {
+                            highWaterMarks[hwKey].current = 0;
+                            highWaterMarks[hwKey].failed = 0;
+                        } else {
+                            highWaterMarks[hwKey].current = Math.max(highWaterMarks[hwKey].current, current);
+                            highWaterMarks[hwKey].failed = Math.max(highWaterMarks[hwKey].failed, failedCount);
+                        }
 
                         current = highWaterMarks[hwKey].current;
                         failedCount = highWaterMarks[hwKey].failed;

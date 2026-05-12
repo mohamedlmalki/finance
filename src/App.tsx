@@ -37,6 +37,8 @@ import { InvoiceResult } from '@/components/dashboard/inventory/InvoiceResultsDi
 import { useJobTimer } from '@/hooks/useJobTimer';
 import LiveStats from '@/pages/LiveStats';
 
+import HeavyJobDashboard from '@/pages/HeavyJobDashboard';
+
 const queryClient = new QueryClient();
 const SERVER_URL = "http://localhost:3009";
 
@@ -107,6 +109,7 @@ export interface CustomModuleFormData {
     availableFields: ModuleField[];
     concurrency: number;
     stopAfterFailures: number;
+    isHeavyJob?: boolean;
 }
 
 export interface CustomJobResult {
@@ -133,6 +136,9 @@ export interface CustomModuleJobState {
     countdown: number;
     currentDelay: number;
     filterText: string;
+    processedCount?: number;
+    successCount?: number;
+    errorCount?: number;
 }
 
 export interface CustomModuleJobs { [profileName: string]: CustomModuleJobState; }
@@ -197,8 +203,8 @@ const createInitialInvoiceJobState = (): InvoiceJobState => ({
 });
 
 const createInitialCustomJobState = (): CustomModuleJobState => ({
-    formData: { moduleApiName: '', bulkField: '', bulkData: '', staticData: {}, delay: 1, availableFields: [], concurrency: 1, stopAfterFailures: 4 },
-    results: [], isProcessing: false, isPaused: false, isComplete: false, isQueued: false, processingStartTime: null, processingTime: 0, totalToProcess: 0, countdown: 0, currentDelay: 1, filterText: '',
+    formData: { moduleApiName: '', bulkField: '', bulkData: '', staticData: {}, delay: 1, availableFields: [], concurrency: 1, stopAfterFailures: 4, isHeavyJob: false },
+    results: [], isProcessing: false, isPaused: false, isComplete: false, isQueued: false, processingStartTime: null, processingTime: 0, totalToProcess: 0, countdown: 0, currentDelay: 1, filterText: '', processedCount: 0, successCount: 0, errorCount: 0
 });
 
 const createInitialExpenseJobState = (): ExpenseJobState => ({
@@ -329,6 +335,27 @@ const MainApp = () => {
         newSocket.on('billingCustomModuleResult', (result) => handleCustomModuleLikeResult(result, setBillingCustomJobs));
         newSocket.on('flowResult', (result) => handleCustomModuleLikeResult(result, setFlowJobs));
 
+        // 🚀 THE FIX: Correctly updates global App state for Heavy Jobs
+        newSocket.on('heavy-job-update', (data: any) => {
+             setFlowJobs((prev: any) => {
+                const profileJob = prev[data.profileName] || createInitialCustomJobState();
+                const isLast = data.processed >= data.total && data.total > 0;
+                return {
+                    ...prev,
+                    [data.profileName]: {
+                        ...profileJob,
+                        totalToProcess: data.total,
+                        processedCount: data.processed,
+                        successCount: data.success,
+                        errorCount: data.failed,
+                        isComplete: isLast,
+                        isProcessing: !isLast && data.processed > 0,
+                        _isQueued: false
+                    }
+                };
+             });
+        });
+
         newSocket.on('expenseBulkResult', (result: any) => {
              setExpenseJobs(prev => {
                 const job = prev[result.profileName] || createInitialExpenseJobState();
@@ -348,7 +375,6 @@ const MainApp = () => {
              });
         }
 
-        // 🚨 FIXED: Smart Routing for Counters to completely isolate Billing & Inventory
         const routeCustomEvent = (data: any, updates: any) => {
              const jt = data.jobType || data.jobtype || '';
              if (!jt || jt === 'invoice') updateJobStatus(setInvoiceJobs, data, updates);
@@ -362,13 +388,17 @@ const MainApp = () => {
              else if (jt.startsWith('Flow_')) updateJobStatus(setFlowJobs, data, updates);
              else if (jt.startsWith('inv_')) updateJobStatus(setCustomJobs, data, updates); 
              else if (jt.startsWith('cm_')) {
-                 // Fallback: If backend accidentally sends a raw 'cm_', safely route it only to the screen actively running it.
                  setCustomJobs((prev: any) => {
-                     if (prev[data.profileName]?.isProcessing) return { ...prev, [data.profileName]: { ...prev[data.profileName], ...updates } };
+                     if (prev[data.profileName]?.isProcessing) {
+                         return { ...prev, [data.profileName]: { ...prev[data.profileName], ...updates } };
+                     }
                      return prev;
                  });
+                 // 🚀 THE FIX: This syntax error is now fully repaired!
                  setBillingCustomJobs((prev: any) => {
-                     if (prev[data.profileName]?.isProcessing) return { ...prev, [data.profileName]: { ...prev[data.profileName], ...updates } };
+                     if (prev[data.profileName]?.isProcessing) {
+                         return { ...prev, [data.profileName]: { ...prev[data.profileName], ...updates } };
+                     }
                      return prev;
                  });
              }
@@ -526,6 +556,9 @@ const MainApp = () => {
                     <Route path="/expense" element={<ExpenseCustomModule jobs={expenseJobs} setJobs={setExpenseJobs} socket={socket} createInitialJobState={createInitialExpenseJobState} onAddProfile={handleOpenAddProfile} onEditProfile={handleOpenEditProfile} onDeleteProfile={handleDeleteProfile} />} />
                     <Route path="/flow-bulk" element={<FlowCustomModule onAddProfile={handleOpenAddProfile} onEditProfile={handleOpenEditProfile} onDeleteProfile={handleDeleteProfile} jobs={flowJobs} setJobs={setFlowJobs} socket={socket} createInitialJobState={createInitialCustomJobState} isWiping={isWiping} wipeProgress={wipeProgress} />} />
                     <Route path="/live-stats" element={<LiveStats invoiceJobs={invoiceJobs} booksJobs={booksJobs} booksContactJobs={booksContactJobs} booksCustomJobs={booksCustomJobs} billingJobs={billingJobs} billingContactJobs={billingContactJobs} billingCustomJobs={billingCustomJobs} customJobs={customJobs} expenseJobs={expenseJobs} onAddProfile={handleOpenAddProfile} onEditProfile={handleOpenEditProfile} onDeleteProfile={handleDeleteProfile} socket={socket} />} />
+                    
+                    <Route path="/heavy-dashboard" element={<HeavyJobDashboard socket={socket} />} />
+                    
                     <Route path="/" element={<Navigate to="/bulk-invoices" replace />} />
                     <Route path="*" element={<NotFound />} />
                 </Routes>

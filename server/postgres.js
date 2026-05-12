@@ -125,5 +125,17 @@ module.exports = {
     deleteAllJobsByType: async (jobType) => {
         const { rowCount } = await pool.query('DELETE FROM jobs WHERE jobType = $1', [jobType]);
         return { affectedRows: rowCount };
+    },
+
+    // 🚀 NEW: Fetches ONLY the failed items for Heavy Jobs
+    getFailedFlowItems: async (jobId, limit = 50, offset = 0) => {
+        const { rows } = await pool.query(`
+            SELECT id, rownumber as "rowNumber", identifier as account, details as error 
+            FROM job_results 
+            WHERE jobId = $1 AND success = false 
+            ORDER BY timestamp DESC 
+            LIMIT $2 OFFSET $3
+        `, [jobId, limit, offset]);
+        return rows;
     }
 };

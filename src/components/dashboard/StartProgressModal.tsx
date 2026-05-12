@@ -1,0 +1,117 @@
+// --- FILE: src/components/dashboard/StartProgressModal.tsx ---
+import React, { useState, useEffect, useRef } from 'react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Terminal, CheckCircle2, Loader2, Zap } from 'lucide-react';
+import { cn } from '@/lib/utils';
+
+interface StartProgressModalProps {
+    isOpen: boolean;
+    onClose: () => void;
+    isStarting: boolean;
+    startLogs: string[];
+    totalAccounts: number;
+}
+
+export function StartProgressModal({
+    isOpen, onClose, isStarting, startLogs, totalAccounts
+}: StartProgressModalProps) {
+    const [isSuccess, setIsSuccess] = useState(false);
+    const scrollRef = useRef<HTMLDivElement>(null);
+
+    // Reset state when modal opens
+    useEffect(() => {
+        if (isOpen) {
+            setIsSuccess(false);
+        }
+    }, [isOpen]);
+
+    // Handle the transition from Starting to Success
+    useEffect(() => {
+        let timeout: NodeJS.Timeout;
+        if (!isStarting && startLogs.length > 0 && isOpen && !isSuccess) {
+            setIsSuccess(true);
+            
+            // Hold the success screen for 2.5 seconds so the user feels satisfied
+            timeout = setTimeout(() => {
+                onClose();
+            }, 2500);
+        }
+        return () => clearTimeout(timeout);
+    }, [isStarting, startLogs.length, isOpen, isSuccess, onClose]);
+
+    // Auto-scroll the terminal to the bottom
+    useEffect(() => {
+        if (scrollRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+        }
+    }, [startLogs]);
+
+    return (
+        <Dialog open={isOpen} onOpenChange={() => {}}>
+            <DialogHeader className="hidden">
+                <DialogTitle>Master Launch Terminal</DialogTitle>
+            </DialogHeader>
+            <DialogContent className="sm:max-w-xl bg-zinc-950 border-zinc-800 text-blue-400 p-0 overflow-hidden shadow-[0_0_50px_rgba(59,130,246,0.15)]">
+                <div className="flex items-center justify-between px-4 py-3 border-b border-zinc-800 bg-zinc-900/50">
+                    <div className="flex items-center gap-2">
+                        <Terminal className="h-4 w-4 text-zinc-400" />
+                        <span className="text-xs font-mono text-zinc-400 uppercase tracking-wider">Master Launch Sequence</span>
+                    </div>
+                    {isStarting && <Loader2 className="h-4 w-4 animate-spin text-blue-500" />}
+                    {isSuccess && <CheckCircle2 className="h-4 w-4 text-blue-500" />}
+                </div>
+                
+                <div className="p-4 space-y-4">
+                    <div className="flex items-center gap-3 mb-2">
+                        <div className="h-2 w-2 rounded-full bg-blue-500 animate-pulse" />
+                        <span className="text-sm font-mono text-blue-400">Injecting {totalAccounts} accounts into Engine...</span>
+                    </div>
+                    
+                    <ScrollArea className="h-[250px] w-full rounded-md border border-zinc-800 bg-black/50 p-4" ref={scrollRef}>
+                        <div className="space-y-2 font-mono text-xs">
+                            {startLogs.map((log, i) => (
+                                <div key={i} className="flex gap-2 animate-in fade-in slide-in-from-bottom-2 duration-300">
+                                    <span className="text-zinc-600">[{new Date().toISOString().split('T')[1].slice(0,8)}]</span>
+                                    <span className={cn(
+                                        log.includes('Error') ? "text-red-400" : 
+                                        log.includes('Complete') || log.includes('Success') ? "text-green-400 font-bold" : 
+                                        "text-blue-400/80"
+                                    )}>
+                                        {log}
+                                    </span>
+                                </div>
+                            ))}
+                            {isStarting && (
+                                <div className="flex gap-2 mt-2 opacity-50">
+                                    <span className="text-zinc-600">[{new Date().toISOString().split('T')[1].slice(0,8)}]</span>
+                                    <span className="animate-pulse text-blue-400">_</span>
+                                </div>
+                            )}
+                        </div>
+                    </ScrollArea>
+                    
+                    {/* Fake Hollywood Progress Bar */}
+                    <div className="space-y-1">
+                        <div className="flex justify-between text-[10px] font-mono text-zinc-500">
+                            <span>SYSTEM STATUS</span>
+                            <span>{isSuccess ? '100%' : 'INJECTING...'}</span>
+                        </div>
+                        <div className="h-1.5 w-full bg-zinc-900 rounded-full overflow-hidden">
+                            <div 
+                                className={cn("h-full transition-all duration-1000", isSuccess ? "bg-blue-500 w-full" : "bg-blue-500 w-2/3 animate-pulse")}
+                            />
+                        </div>
+                    </div>
+
+                    {isSuccess && (
+                        <div className="bg-blue-500/10 border border-blue-500/30 px-4 py-3 rounded-lg flex items-center justify-center gap-3 animate-in fade-in duration-500 mt-2">
+                            <Zap className="h-5 w-5 text-blue-500" />
+                            <span className="text-blue-400 font-bold font-mono tracking-widest">MASTER BATCH LAUNCHED</span>
+                        </div>
+                    )}
+                </div>
+            </DialogContent>
+        </Dialog>
+    );
+}

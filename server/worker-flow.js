@@ -3,8 +3,8 @@ require('dotenv').config();
 const { Worker, Queue } = require('bullmq'); 
 const axios = require('axios'); 
 
-const http = require('http');   // <--- ADD THIS
-const https = require('https'); // <--- ADD THIS
+const http = require('http');   
+const https = require('https'); 
 // The Enterprise Connection Pool (Fixes the "not defined" error)
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60000 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10, timeout: 60000 });
@@ -50,9 +50,19 @@ console.log(`${cliColors.yellowBold} ===========================================
 const connection = { host: process.env.REDIS_HOST || '127.0.0.1', port: process.env.REDIS_PORT || 6379, maxRetriesPerRequest: null };
 const activeWorkers = {};
 
+// 🚀 THROTTLE ENGINE: Prevents Postgres from melting down by only checking progress once per second
+const lastEmitMap = {};
+
 // 📊 TUI STATE CALCULATOR
-async function printProgressBar(jobId, selectedProfileName) {
+async function printProgressBar(jobId, selectedProfileName, isHeavyJob = false, forceUpdate = false) {
     try {
+        const now = Date.now();
+        // If not forced, limit updates to 1 per second per job
+        if (!forceUpdate && lastEmitMap[jobId] && now - lastEmitMap[jobId] < 1000) {
+            return; 
+        }
+        lastEmitMap[jobId] = now;
+
         const checkDb = await db.query("SELECT totaltoprocess FROM jobs WHERE id = $1", [jobId]);
         let total = checkDb.rows.length > 0 ? checkDb.rows[0].totaltoprocess : 0;
         if (!total) return;
@@ -68,6 +78,20 @@ async function printProgressBar(jobId, selectedProfileName) {
         activeProgress[selectedProfileName] = { str: `   ${cliColors.gray}↳${cliColors.reset} ${bar} ${cliColors.whiteBold}${percent}%${cliColors.reset}  (${processed}/${total}) - ${selectedProfileName}` };
         clearProgressLines();
         renderAllProgress();
+
+        // 🚀 THE FIX: If Heavy Job, emit math ONLY to the frontend
+        if (isHeavyJob) {
+            const successDb = await db.query("SELECT COUNT(*) as count FROM job_results WHERE jobId = $1 AND success = true", [jobId]);
+            const failedDb = await db.query("SELECT COUNT(*) as count FROM job_results WHERE jobId = $1 AND success = false", [jobId]);
+            
+            emitToWeb('heavy-job-update', {
+                total,
+                processed,
+                success: parseInt(successDb.rows[0].count),
+                failed: parseInt(failedDb.rows[0].count),
+                profileName: selectedProfileName
+            });
+        }
     } catch (e) {}
 }
 
@@ -87,7 +111,6 @@ async function injectFlowTracking(html, email, selectedProfileName, config) {
 
     for (let rawUrl of uniqueLinks) {
         if (rawUrl.match(/\.(png|jpg|jpeg|gif|webp|svg)(?:[?#].*)?$/i) || rawUrl.includes('track.gif')) continue;
-        // Check if it already has the data param to avoid double-injecting
         if (!rawUrl.includes('?data=') && !rawUrl.includes('&data=')) {
             const separator = rawUrl.includes('?') ? '&' : '?';
             newText = newText.split(rawUrl).join(`${rawUrl}${separator}data=${encodedData}`);
@@ -102,7 +125,8 @@ async function injectFlowTracking(html, email, selectedProfileName, config) {
 }
 
 const processFlowJob = async (job) => {
-    const { rowData, identifier, webhookUrl, selectedProfileName, delay, activeProfile, rowNumber, trackingEnabled, targetHtmlField, bulkField, staticData, jobId, appendAccountName, accountIndex, useStrictCallback, workerUrl } = job.data;
+    // 🚨 EXTRACT isHeavyJob HERE
+    const { rowData, identifier, webhookUrl, selectedProfileName, delay, activeProfile, rowNumber, trackingEnabled, targetHtmlField, bulkField, staticData, jobId, appendAccountName, accountIndex, useStrictCallback, workerUrl, isHeavyJob } = job.data;
 
     const checkAndFreeze = async () => {
         let rec = await db.query("SELECT status FROM jobs WHERE id = $1", [jobId]);
@@ -140,7 +164,6 @@ const processFlowJob = async (job) => {
     }
 
     if (trackingEnabled && targetHtmlField && rawPayload[targetHtmlField]) {
-        // FIX: Pass the entire activeProfile so it can find cloudflareTrackingUrl at the root level
         rawPayload[targetHtmlField] = await injectFlowTracking(rawPayload[targetHtmlField], identifier, selectedProfileName, activeProfile);
     }
 
@@ -166,9 +189,9 @@ const processFlowJob = async (job) => {
     try {
         const response = await axios.post(webhookUrl.trim(), finalPayload, { 
             headers: { 'Content-Type': 'application/json' },
-            httpAgent,           // Recycle HTTP connections
-            httpsAgent,          // Recycle HTTPS connections
-            timeout: 30000       // Wait max 30 seconds before timing out
+            httpAgent,           
+            httpsAgent,          
+            timeout: 30000       
         });
         fullResponse = typeof response.data === 'string' && response.data.length > 1000 ? response.data.substring(0, 1000) + '... [TRUNCATED]' : response.data;
         
@@ -207,8 +230,12 @@ const processFlowJob = async (job) => {
 
     if (isSuccess === true || isSuccess === null) {
         await db.query("UPDATE jobs SET consecutivefailures = 0 WHERE id = $1 AND status = 'running'", [jobId]);
-        emitToWeb('flowResult', emitPayload);
-        await printProgressBar(jobId, selectedProfileName);
+        
+        // 🚨 CRITICAL FIX: Only blast row data to the UI if it is NOT a Heavy Job
+        if (!isHeavyJob) {
+            emitToWeb('flowResult', emitPayload);
+        }
+        await printProgressBar(jobId, selectedProfileName, isHeavyJob);
     } else {
         let shouldCooldown = false;
         let stopLimit = 0;
@@ -226,11 +253,14 @@ const processFlowJob = async (job) => {
             }
         }
         
-        emitToWeb('flowResult', emitPayload);
-        await printProgressBar(jobId, selectedProfileName);
+        // 🚨 CRITICAL FIX
+        if (!isHeavyJob) {
+            emitToWeb('flowResult', emitPayload);
+        }
+        await printProgressBar(jobId, selectedProfileName, isHeavyJob);
         
         if (shouldCooldown) {
-            emitToWeb('flowResult', { rowNumber: 0, identifier: 'SYSTEM INFO', stage: 'complete', success: false, details: `⏳ AUTO-PAUSE: Hit ${stopLimit} consecutive failures. Cooling down for 60 seconds...`, profileName: selectedProfileName, time: '1:00.000', timestamp: new Date() });
+            if (!isHeavyJob) emitToWeb('flowResult', { rowNumber: 0, identifier: 'SYSTEM INFO', stage: 'complete', success: false, details: `⏳ AUTO-PAUSE: Hit ${stopLimit} consecutive failures. Cooling down for 60 seconds...`, profileName: selectedProfileName, time: '1:00.000', timestamp: new Date() });
             await new Promise(res => setTimeout(res, 60000));
         }
         throw new Error(details);
@@ -251,7 +281,6 @@ setInterval(async () => {
             } catch (e) {}
         }
 
-        // 🚨 ISOLATION: Only look for jobs that start with Flow_
         const dbJobs = await db.query("SELECT * FROM jobs WHERE status IN ('running', 'queued', 'paused', 'paused_queued') AND jobType LIKE 'Flow_%'");
         
         const parsedJobs = dbJobs.rows.map(row => {
@@ -277,12 +306,8 @@ setInterval(async () => {
             }
         }
 
-        // 🚨 FIX: Removed isGlobalFreeze to enforce concurrency!
         let runningCount = 0;
-        // MUST count paused jobs too, because they are frozen in memory and holding their concurrency slot!
         sortedJobs.forEach(j => { if (j.status === 'running' || j.status === 'paused') runningCount++; });
-		
-		
 
         for (const dbJob of sortedJobs) {
             let queueName = `FlowQueue_${dbJob.profilename}`;
@@ -291,10 +316,7 @@ setInterval(async () => {
             if (dbJob.status === 'queued') {
                 if (runningCount >= masterLimit) continue; 
                 
-                // 🔥 THE FIX: Atomic lock! It will ONLY update to running if it wasn't just paused by the user!
                 const updateRes = await db.query("UPDATE jobs SET status = 'running' WHERE id = $1 AND status = 'queued' RETURNING id", [dbJob.id]);
-                
-                // If it fails, it means the user clicked Pause a millisecond before this ran. Skip it!
                 if (updateRes.rowCount === 0) continue; 
                 
                 emitToWeb('jobStarted', { profileName: dbJob.profilename, jobType: dbJob.jobtype });
@@ -326,6 +348,10 @@ setInterval(async () => {
 
                 worker.on('drained', async () => {
                     const checkDb = await db.query("SELECT status FROM jobs WHERE id = $1", [dbJob.id]);
+                    
+                    // 🚀 THE FIX: Force the final UI update when drained, so the frontend successfully hits 100%
+                    await printProgressBar(dbJob.id, dbJob.profilename, dbJob.formdata?.isHeavyJob, true);
+
                     if (checkDb.rows.length > 0) {
                         const currentStatus = checkDb.rows[0].status;
                         if (currentStatus === 'paused') {

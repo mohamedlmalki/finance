@@ -348,7 +348,17 @@ io.on('connection', (socket) => {
             socket.emit('wipeProgress', { jobType, message: `Stopping all active workers...` });
             
             let targetJobTypes = [jobType];
-            if (jobType && jobType.startsWith('cm_')) {
+            
+            // 🚀 THE FIX: Dynamically grab ALL Flow accounts and wipe them sequentially
+            if (jobType === 'Flow') {
+                const profiles = readProfiles();
+                const allFlows = new Set();
+                profiles.forEach(p => {
+                    if (p.flow?.webhookUrl) allFlows.add(`Flow_${p.profileName}`);
+                });
+                targetJobTypes = Array.from(allFlows);
+            }
+            else if (jobType && jobType.startsWith('cm_')) {
                 const profiles = readProfiles();
                 const allCustomModules = new Set([jobType]);
                 profiles.forEach(p => {
@@ -377,13 +387,13 @@ io.on('connection', (socket) => {
                 let currentDeletedResults = 0;
 
                 if (currentJobType.startsWith('Flow_')) {
-                    const profiles = readProfiles();
-                    for (const p of profiles) { 
-                        if (flowHandler.killClock) {
-                            await flowHandler.killClock(p.profileName); // 👈 CHANGE THIS LINE
-                        }
+                    const profileName = currentJobType.replace('Flow_', ''); // Extract the name for UI
+                    if (flowHandler.killClock) {
+                        await flowHandler.killClock(profileName); 
                     }
-                    console.log(`  ${cliColors.gray}➤ [SYSTEM COMMAND] Terminated all Flow clocks for ${currentJobType}${cliColors.reset}`);
+                    console.log(`  ${cliColors.gray}➤ [SYSTEM COMMAND] Terminated Flow clock for ${currentJobType}${cliColors.reset}`);
+                    // 🚀 Added UI Update: Tell the frontend exactly who we are wiping
+                    socket.emit('wipeProgress', { jobType, message: `Haulting active workers for ${profileName}...` });
                 } else {
                     socket.emit('wipeProgress', { jobType, message: `Obliterating BullMQ Redis Queues for ${currentJobType}...` });
                     const { Queue } = require('bullmq');
@@ -443,16 +453,15 @@ io.on('connection', (socket) => {
                 console.log(`✅ Postgres Results Deleted: ${currentDeletedResults} (Cascade)`);
                 console.log(`${cliColors.redBold}=================================================${cliColors.reset}\n`);
                 
-                // 🔥 THE FIX: Tell Node.js to wait for 1 second before wiping the next module
-                // This ensures the logs print beautifully one by one without getting mixed up!
+                // 🔥 PROTECTS POSTGRES: Waits 1 full second before moving to the next account
                 await new Promise(resolve => setTimeout(resolve, 1000));
             }
 
             console.log(`\n${cliColors.redBold}🟥 [NUCLEAR MASTER WIPE EXECUTED] Target: ${jobType}${cliColors.reset}`);
             console.log(`=================================================`);
-            console.log(`✅ Redis Queues Vaporized: ${vaporizedCount}`);
-            console.log(`✅ Postgres Jobs Deleted: ${deletedJobsCount}`);
-            console.log(`✅ Postgres Results Deleted: ${deletedResultsCount} (Cascade)`);
+            console.log(`✅ Total Redis Queues Vaporized: ${vaporizedCount}`);
+            console.log(`✅ Total Postgres Jobs Deleted: ${deletedJobsCount}`);
+            console.log(`✅ Total Postgres Results Deleted: ${deletedResultsCount} (Cascade)`);
             console.log(`=================================================\n`);
 
             socket.emit('wipeProgress', { jobType, message: `Wipe Complete.` });
@@ -588,6 +597,31 @@ io.on('connection', (socket) => {
     // ⚡ FLOW / WEBHOOKS
     socket.on('startBulkFlowJob', (data) => { const profiles = readProfiles(); const activeProfile = profiles.find(p => p.profileName === data.selectedProfileName); if (activeProfile) flowHandler.handleStartBulkFlowJob(socket, { ...data, activeProfile }); });
     socket.on('startMasterBatchFlowJob', (data) => { flowHandler.handleStartMasterBatch(socket, data); });
+    socket.on('getFailedFlowItems', (data) => { flowHandler.handleGetFailedFlowItems(socket, data); });
+
+    // 🚀 NEW: BULLETPROOF MASTER CONTROLS
+    socket.on('pauseAllFlowJobs', async () => {
+        try {
+            await db.query(`UPDATE jobs SET status = CASE WHEN status = 'queued' THEN 'paused_queued' WHEN status = 'running' THEN 'paused' ELSE status END WHERE jobType LIKE 'Flow_%' AND status IN ('queued', 'running')`);
+        } catch (error) {}
+    });
+
+    socket.on('resumeAllFlowJobs', async () => {
+        try {
+            await db.query(`UPDATE jobs SET status = CASE WHEN status = 'paused_queued' THEN 'queued' WHEN status = 'paused' THEN 'running' ELSE status END WHERE jobType LIKE 'Flow_%' AND status IN ('paused_queued', 'paused')`);
+        } catch (error) {}
+    });
+
+    socket.on('endAllFlowJobs', async () => {
+        try {
+            const runningJobs = await db.query("SELECT profilename FROM jobs WHERE jobtype LIKE 'Flow_%' AND status IN ('running', 'queued', 'paused', 'paused_queued')");
+            await db.query("UPDATE jobs SET status = 'ended' WHERE jobtype LIKE 'Flow_%' AND status IN ('running', 'queued', 'paused', 'paused_queued')");
+            for (const row of runningJobs.rows) {
+                if (flowHandler.killClock) await flowHandler.killClock(row.profilename);
+            }
+        } catch (error) {}
+    });
+	
 });
 
 server.listen(port, () => {

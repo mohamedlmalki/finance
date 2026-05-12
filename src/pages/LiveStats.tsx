@@ -1,3 +1,4 @@
+// --- FILE: src/pages/LiveStats.tsx ---
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom'; 
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
@@ -52,8 +53,9 @@ const ServiceStatCard = ({
 }) => {
     const navigate = useNavigate(); 
 
+    // We keep jobs that have results, are processing, OR are tagged as heavy jobs
     const activeProfiles = Object.entries(jobMap).filter(([_, job]: [string, any]) => 
-        (job.results?.length > 0 || job.isProcessing)
+        (job.results?.length > 0 || job.isProcessing || job.formData?.isHeavyJob)
     );
 
     if (activeProfiles.length === 0) {
@@ -84,6 +86,31 @@ const ServiceStatCard = ({
             </CardHeader>
             <CardContent className="space-y-4 pt-4">
                 {activeProfiles.map(([profileName, job]: [string, any]) => {
+                    // 🚀 ADDED: THE HEAVY JOB SAFETY CHECK
+                    const isHeavy = job.formData?.isHeavyJob;
+                    
+                    if (isHeavy) {
+                        return (
+                            <div key={profileName} className="space-y-2 border-b last:border-0 pb-3 last:pb-0 bg-rose-50/50 p-3 rounded-lg border border-rose-100">
+                                <div className="flex items-center justify-between">
+                                    <Badge variant="outline" className="border-rose-300 text-rose-700 bg-white">
+                                        {profileName} (HEAVY JOB)
+                                    </Badge>
+                                    <span className="flex items-center text-xs text-rose-600 font-medium animate-pulse">
+                                        <Activity className="h-3 w-3 mr-1" /> Safe Mode
+                                    </span>
+                                </div>
+                                <Button 
+                                    size="sm" 
+                                    className="w-full mt-2 bg-rose-600 hover:bg-rose-700 text-white" 
+                                    onClick={() => navigate('/heavy-dashboard', { state: { profileName, jobId: `Flow_${profileName}_${profileName}` } })}
+                                >
+                                    View Heavy Dashboard
+                                </Button>
+                            </div>
+                        );
+                    }
+
                     const successCount = job.results.filter((r: any) => r.success === true).length;
                     const failCount = job.results.filter((r: any) => r.success === false).length;
                     const totalProcessed = job.results.length;
@@ -232,12 +259,16 @@ export const LiveStats: React.FC<LiveStatsProps> = ({
                     activeJobCount++;
                     globalIsProcessing = true;
                 }
-                if (job.results) {
-                    totalSuccess += job.results.filter((r: any) => r.success === true).length;
-                    totalErrors += job.results.filter((r: any) => r.success === false).length;
-                    globalTotalProcessed += job.results.length;
+                
+                // 🚀 SKIP AGGREGATING HEAVY JOBS HERE SO THEY DONT CRASH THE TOTALS
+                if (!job.formData?.isHeavyJob) {
+                    if (job.results) {
+                        totalSuccess += job.results.filter((r: any) => r.success === true).length;
+                        totalErrors += job.results.filter((r: any) => r.success === false).length;
+                        globalTotalProcessed += job.results.length;
+                    }
+                    if (job.totalToProcess) globalTotalToProcess += job.totalToProcess;
                 }
-                if (job.totalToProcess) globalTotalToProcess += job.totalToProcess;
 
                 if (job.processingStartTime) {
                     const start = new Date(job.processingStartTime).getTime();

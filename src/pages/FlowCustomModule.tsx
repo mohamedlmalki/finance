@@ -3,6 +3,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { DashboardLayout } from '@/components/dashboard/DashboardLayout';
 import { FlowCustomModuleApplyAllModal } from '@/components/dashboard/FlowCustomModuleApplyAllModal';
+import { WipeProgressModal } from '@/components/dashboard/WipeProgressModal'; 
 import { useToast } from '@/hooks/use-toast';
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -13,7 +14,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from '@/components/ui/dialog';
 import { Checkbox } from '@/components/ui/checkbox';
-import { cn, formatTime } from '@/lib/utils';
+import { cn } from '@/lib/utils';
 import { Socket } from 'socket.io-client';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import { Profile, CustomModuleJobs, CustomModuleJobState } from '@/App';
@@ -22,10 +23,19 @@ import {
     Search, FileText, BarChart3, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, 
     Eye, RotateCcw, Trash2, AlertTriangle, Zap, CopyCheck, AlertOctagon
 } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 
 const SERVER_URL = "http://localhost:3009";
 const ITEMS_PER_PAGE = 10;
 const MAX_BUFFER_SIZE = 500; 
+
+const formatHHMMSS = (seconds: number) => {
+    if (!seconds || isNaN(seconds)) return "00:00:00";
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+};
 
 interface FlowCustomModuleProps {
   onAddProfile: () => void;
@@ -43,9 +53,18 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
     onAddProfile, onEditProfile, onDeleteProfile, jobs, setJobs, socket, createInitialJobState, isWiping, wipeProgress
 }) => {
     const { toast } = useToast();
+    const navigate = useNavigate();
+    
     const [activeProfileName, setActiveProfileName] = useState<string | null>(() => localStorage.getItem('flowCustomModuleActiveProfile') || null);
     const [isStatusModalOpen, setIsStatusModalOpen] = useState(false);
     const [isApplyAllModalOpen, setIsApplyAllModalOpen] = useState(false); 
+    
+    // Wipe Modal State
+    const [wipeModalState, setWipeModalState] = useState<{isOpen: boolean, type: 'single' | 'all', target: string | null}>({isOpen: false, type: 'single', target: null});
+    const sequentialQueueRef = useRef<string[]>([]);
+    const isSequentialRef = useRef<boolean>(false);
+    const [masterWipeActive, setMasterWipeActive] = useState(false);
+
     const [dbSearchResults, setDbSearchResults] = useState<any[] | null>(null);
     const [isSearchingDB, setIsSearchingDB] = useState(false);
     const [isExporting, setIsExporting] = useState(false);
@@ -57,28 +76,19 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
     const autoLoadAttemptedRef = useRef<Record<string, boolean>>({});
     const isAutoLoadingRef = useRef<Record<string, boolean>>({});
     const resultBufferRef = useRef<any[]>([]);
-    
-    // Decouple the Jobs state from the polling loop using useRef
     const jobsRef = useRef<CustomModuleJobs>(jobs);
 
-    useEffect(() => {
-        jobsRef.current = jobs;
-    }, [jobs]);
+    useEffect(() => { jobsRef.current = jobs; }, [jobs]);
 
     const [apiStatus] = useState<{ status: 'success', message: string }>({ status: 'success', message: 'Ready: Webhooks do not require persistent Zoho tokens.' });
 
     const { data: profiles = [] } = useQuery<Profile[]>({
         queryKey: ['profiles'],
-        queryFn: async () => {
-            const res = await fetch(`${SERVER_URL}/api/profiles`);
-            if (!res.ok) throw new Error("Failed to fetch profiles");
-            return res.json();
-        },
+        queryFn: async () => { const res = await fetch(`${SERVER_URL}/api/profiles`); if (!res.ok) throw new Error("Failed to fetch profiles"); return res.json(); },
     });
 
     const flowProfiles = profiles.filter(p => p.flow?.webhookUrl);
     const selectedProfile = flowProfiles.find(p => p.profileName === activeProfileName) || null;
-
     const activeAccIndex = flowProfiles.findIndex(p => p.profileName === activeProfileName) + 1;
     const BR_STRING = "<br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br><br>";
 
@@ -98,8 +108,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
             if (savedForms) {
                 const parsed = JSON.parse(savedForms);
                 setJobs(prev => {
-                    const next = { ...prev };
-                    let hasChanges = false;
+                    const next = { ...prev }; let hasChanges = false;
                     Object.keys(parsed).forEach(profileName => {
                         const existingJob = next[profileName] || createInitialJobState();
                         next[profileName] = { ...existingJob, formData: { ...existingJob.formData, ...parsed[profileName] } };
@@ -113,8 +122,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
 
     useEffect(() => {
         try {
-            const formsToSave: Record<string, any> = {};
-            let hasData = false;
+            const formsToSave: Record<string, any> = {}; let hasData = false;
             Object.keys(jobs).forEach(profileName => {
                 if (jobs[profileName]?.formData) { formsToSave[profileName] = jobs[profileName].formData; hasData = true; }
             });
@@ -139,96 +147,46 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         }
     }, [activeProfileName, jobs, socket]);
 
-    // ==========================================
-    // 🚀 STRICT SEQUENTIAL POLLING ENGINE 🚀
-    // ==========================================
     useEffect(() => {
-        let isCancelled = false;
-        let isRunning = false;
-
+        let isCancelled = false; let isRunning = false;
         const interval = setInterval(async () => {
             if (isCancelled || isRunning) return;
-            
             const currentJobs = jobsRef.current;
             if (!activeProfileName || !currentJobs[activeProfileName]) return;
-            
             const job = currentJobs[activeProfileName];
             const savedWorkerUrl = selectedProfile?.flow?.workerUrl;
-            
             if (!savedWorkerUrl || !(job.formData as any).useStrictCallback) return;
-
-            // 1. Get all waiting items and SORT them to guarantee exact top-to-bottom checking
-            const waitingItems = [...job.results]
-                .filter(r => r.stage === 'waiting' && r.trackingId)
-                .sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
-
+            const waitingItems = [...job.results].filter(r => r.stage === 'waiting' && r.trackingId).sort((a, b) => (a.rowNumber || 0) - (b.rowNumber || 0));
             if (waitingItems.length === 0) return;
-
             isRunning = true;
-            
-            // 2. Fetch sequentially. This completely bypasses the browser's 6-connection limit
-            //    and guarantees that they turn green exactly in order!
             for (const res of waitingItems) {
                 if (isCancelled) break;
-
                 const elapsed = Date.now() - new Date(res.timestamp || Date.now()).getTime();
                 const jobId = `Flow_${activeProfileName}_${activeProfileName}`;
                 let updated = false;
-
-                // 🔥 FIX: Increased to 120 seconds because Zoho Flow queues can take a while when paused
                 if (elapsed > 120000) { 
                     setJobs(prev => {
-                        const next = { ...prev };
-                        const lJob = next[activeProfileName];
-                        if (!lJob) return prev;
-                        
-                        const lResults = [...lJob.results];
-                        const idx = lResults.findIndex(x => x.trackingId === res.trackingId);
-                        
+                        const next = { ...prev }; const lJob = next[activeProfileName]; if (!lJob) return prev;
+                        const lResults = [...lJob.results]; const idx = lResults.findIndex(x => x.trackingId === res.trackingId);
                         if (idx >= 0 && lResults[idx].stage === 'waiting') {
                             lResults[idx] = { ...lResults[idx], stage: 'complete', success: false, details: 'Timeout: Zoho Flow took over 120s.' };
                             socket?.emit('updateFlowResult', { jobId, rowNumber: res.rowNumber, success: false, details: lResults[idx].details, profileName: activeProfileName });
-                            
-                            return { 
-                                ...next, 
-                                [activeProfileName]: { 
-                                    ...lJob, 
-                                    results: lResults, 
-                                    errorCount: (lJob.errorCount || 0) + 1, 
-                                    processedCount: (lJob.processedCount || 0) + 1 
-                                } as any 
-                            };
+                            return { ...next, [activeProfileName]: { ...lJob, results: lResults, errorCount: (lJob.errorCount || 0) + 1, processedCount: (lJob.processedCount || 0) + 1 } as any };
                         }
                         return next;
                     });
                     updated = true;
                 } else {
                     try {
-                        const req = await fetch(`${savedWorkerUrl}?id=${res.trackingId}`);
-                        const data = await req.json();
-                        
+                        const req = await fetch(`${savedWorkerUrl}?id=${res.trackingId}`); const data = await req.json();
                         if (data.success && !isCancelled) {
                             setJobs(prev => {
-                                const next = { ...prev };
-                                const lJob = next[activeProfileName];
-                                if (!lJob) return prev;
-                                
-                                const lResults = [...lJob.results];
-                                const idx = lResults.findIndex(x => x.trackingId === res.trackingId);
-                                
+                                const next = { ...prev }; const lJob = next[activeProfileName]; if (!lJob) return prev;
+                                const lResults = [...lJob.results]; const idx = lResults.findIndex(x => x.trackingId === res.trackingId);
                                 if (idx >= 0 && lResults[idx].stage === 'waiting') {
                                     lResults[idx] = { ...lResults[idx], stage: 'complete', success: true, details: 'Verified by Cloudflare Worker!' };
                                     socket?.emit('updateFlowResult', { jobId, rowNumber: res.rowNumber, success: true, details: lResults[idx].details, profileName: activeProfileName });
-                                    
-                                    return { 
-                                        ...next, 
-                                        [activeProfileName]: { 
-                                            ...lJob, 
-                                            results: lResults, 
-                                            successCount: (lJob.successCount || 0) + 1, 
-                                            processedCount: (lJob.processedCount || 0) + 1 
-                                        } as any 
-                                    };
+                                    return { ...next, [activeProfileName]: { ...lJob, results: lResults, successCount: (lJob.successCount || 0) + 1, processedCount: (lJob.processedCount || 0) + 1 } as any };
                                 }
                                 return next;
                             });
@@ -236,56 +194,30 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                         }
                     } catch (e) {}
                 }
-
-                // If we updated the screen, give React 100ms to paint the green checkmark
-                // before we freeze the thread checking the next row!
-                if (updated) {
-                    await new Promise(resolve => setTimeout(resolve, 100));
-                }
+                if (updated) await new Promise(resolve => setTimeout(resolve, 100));
             }
-            
             isRunning = false;
         }, 3000); 
-        
-        return () => {
-            isCancelled = true;
-            clearInterval(interval);
-        };
+        return () => { isCancelled = true; clearInterval(interval); };
     }, [activeProfileName, socket, selectedProfile]);
 
-    // THE ONLY BUFFER PROCESSOR 
     useEffect(() => {
         const interval = setInterval(() => {
             if (resultBufferRef.current.length > 0) {
                 const resultsToProcess = [...resultBufferRef.current];
                 resultBufferRef.current = []; 
                 setJobs(prev => {
-                    let next = { ...prev };
-                    let changed = false;
-                    const grouped: Record<string, any[]> = {};
-                    resultsToProcess.forEach(r => {
-                        if (!grouped[r.profileName]) grouped[r.profileName] = [];
-                        grouped[r.profileName].push(r);
-                    });
+                    let next = { ...prev }; let changed = false; const grouped: Record<string, any[]> = {};
+                    resultsToProcess.forEach(r => { if (!grouped[r.profileName]) grouped[r.profileName] = []; grouped[r.profileName].push(r); });
                     Object.keys(grouped).forEach(profileName => {
                         const currentJob = getSafeJob(next, profileName);
-                        let newResults = [...currentJob.results];
-                        let newProcessed = currentJob.processedCount || 0;
-                        let newSuccess = currentJob.successCount || 0;
-                        let newError = currentJob.errorCount || 0;
+                        let newResults = [...currentJob.results]; let newProcessed = currentJob.processedCount || 0; let newSuccess = currentJob.successCount || 0; let newError = currentJob.errorCount || 0;
                         grouped[profileName].forEach(result => {
                             const existingIndex = newResults.findIndex(r => r.rowNumber === result.rowNumber);
-                            
                             if (result.stage === 'complete') {
-                                if (existingIndex === -1 || newResults[existingIndex].stage !== 'complete') {
-                                    newProcessed++;
-                                    if (result.success) newSuccess++;
-                                    else newError++;
-                                }
+                                if (existingIndex === -1 || newResults[existingIndex].stage !== 'complete') { newProcessed++; if (result.success) newSuccess++; else newError++; }
                             }
-                            
-                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...result };
-                            else newResults.unshift(result);
+                            if (existingIndex >= 0) newResults[existingIndex] = { ...newResults[existingIndex], ...result }; else newResults.unshift(result);
                         });
                         newResults = newResults.sort((a, b) => (b.rowNumber || 0) - (a.rowNumber || 0)).slice(0, MAX_BUFFER_SIZE);
                         const isDone = newProcessed >= currentJob.totalToProcess && currentJob.totalToProcess > 0;
@@ -302,15 +234,35 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
     useEffect(() => {
         if (!socket) return;
         const handleBufferedResult = (result: any) => { resultBufferRef.current.push(result); };
+        
+        const handleHeavyUpdate = (data: any) => {
+            setJobs(prev => {
+                const profileJob = getSafeJob(prev, data.profileName);
+                const isLast = data.processed >= data.total && data.total > 0;
+                return {
+                    ...prev,
+                    [data.profileName]: {
+                        ...profileJob,
+                        totalToProcess: data.total,
+                        processedCount: data.processed,
+                        successCount: data.success,
+                        errorCount: data.failed,
+                        isComplete: isLast,
+                        isProcessing: !isLast && data.processed > 0,
+                        _isQueued: false 
+                    } as any
+                };
+            });
+        };
+        socket.on('heavy-job-update', handleHeavyUpdate);
+
         const handleSync = (allJobs: any[]) => {
             setJobs(prev => {
-                const next = { ...prev };
-                let hasChanges = false;
+                const next = { ...prev }; let hasChanges = false;
                 allJobs.forEach(dbJob => {
                     if (!dbJob.jobtype?.startsWith('Flow_') && !dbJob.jobType?.startsWith('Flow_')) return;
                     const profileName = dbJob.profilename || dbJob.profileName;
                     const existingJob = getSafeJob(next, profileName);
-                    
                     if ((existingJob as any)._isQueued || (existingJob.isProcessing && (existingJob as any)._ignition === false)) return;
                     
                     const newProcessed = Math.max(existingJob.processedCount || 0, dbJob.processedCount || dbJob.processedcount || 0);
@@ -319,86 +271,44 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                     const newTotal = dbJob.totalToProcess || dbJob.totaltoprocess || existingJob.totalToProcess || 0;
                     const isDone = newProcessed >= newTotal && newTotal > 0;
                     
-                    let backendIsProcessing = false; 
-                    let backendIsQueued = false; 
-                    let backendIsPaused = dbJob.status === 'paused' || dbJob.status === 'paused_queued';
-                    
+                    let backendIsProcessing = false; let backendIsQueued = false; let backendIsPaused = dbJob.status === 'paused' || dbJob.status === 'paused_queued';
                     if (existingJob.isPaused && dbJob.status === 'running') { backendIsPaused = true; }
-                    
-                    if (!isDone) {
-                        if (backendIsPaused) { backendIsProcessing = true; }
-                        else if (dbJob.status === 'running') { backendIsProcessing = true; }
-                        else if (dbJob.status === 'queued') { backendIsQueued = true; }
-                    }
+                    if (!isDone) { if (backendIsPaused) backendIsProcessing = true; else if (dbJob.status === 'running') backendIsProcessing = true; else if (dbJob.status === 'queued') backendIsQueued = true; }
                     if ((existingJob as any)._forceStopped) { backendIsProcessing = false; backendIsPaused = false; } 
                     
                     let mergedResults = [...(existingJob.results || [])];
                     if (dbJob.results && Array.isArray(dbJob.results)) {
                         dbJob.results.forEach((dbResult: any) => {
                             const idx = mergedResults.findIndex(r => r.rowNumber === dbResult.rowNumber);
-                            let formatStage = 'complete';
-                            if (dbResult.success === null) formatStage = 'waiting';
-
-                            if (idx === -1) mergedResults.push({ ...dbResult, stage: formatStage });
-                            else mergedResults[idx] = { ...mergedResults[idx], ...dbResult, stage: formatStage };
+                            let formatStage = 'complete'; if (dbResult.success === null) formatStage = 'waiting';
+                            if (idx === -1) mergedResults.push({ ...dbResult, stage: formatStage }); else mergedResults[idx] = { ...mergedResults[idx], ...dbResult, stage: formatStage };
                         });
                         mergedResults.sort((a, b) => { const numA = a.rowNumber || a.fallbackRowNumber || 0; const numB = b.rowNumber || b.fallbackRowNumber || 0; return numB - numA; });
                         mergedResults = mergedResults.slice(0, MAX_BUFFER_SIZE);
                     }
                     
-                    // 🔥 1. PERFECT SYNC: RECOVER ALL FORM DATA FROM POSTGRES DB
                     let restoredFormData = existingJob.formData;
                     if (dbJob.formdata || dbJob.formData) {
                         let parsed = dbJob.formdata || dbJob.formData;
-                        if (typeof parsed === 'string') {
-                            try { parsed = JSON.parse(parsed); } catch(e){}
-                        }
-                        if (parsed && typeof parsed === 'object') {
-                            restoredFormData = { ...existingJob.formData, ...parsed };
-                        }
+                        if (typeof parsed === 'string') { try { parsed = JSON.parse(parsed); } catch(e){} }
+                        if (parsed && typeof parsed === 'object') { restoredFormData = { ...existingJob.formData, ...parsed }; }
                     }
 
-                    // 🔥 2. PERFECT SYNC: RECOVER EXACT ELAPSED TIME (WITH TIMEZONE FIX)
                     let currentProcessingTime = existingJob.processingTime || 0;
                     let startTime = dbJob.processingstarttime || dbJob.processingStartTime;
-                    
-                    // Only recalculate if the timer is at 0 (e.g. you just refreshed the page)
                     if (currentProcessingTime === 0 && startTime && backendIsProcessing && !backendIsPaused) {
                         const startTimestamp = new Date(startTime).getTime();
-                        let elapsedSeconds = Math.floor((Date.now() - startTimestamp) / 1000);
-                        
-                        // 🛠️ THE BUG FIX: Neutralize Postgres Naive Timezone Shift
-                        // Postgres naive timestamps shift by the local timezone offset (Morocco = +60 mins).
-                        // We reverse this mathematically so it doesn't add a random 60 minutes!
-                        const offsetSeconds = new Date().getTimezoneOffset() * 60;
-                        elapsedSeconds += offsetSeconds;
-                        
-                        if (elapsedSeconds < 0) elapsedSeconds = 0;
-                        currentProcessingTime = elapsedSeconds;
+                        let elapsedSeconds = Math.floor((Date.now() - startTimestamp) / 1000) + (new Date().getTimezoneOffset() * 60);
+                        if (elapsedSeconds < 0) elapsedSeconds = 0; currentProcessingTime = elapsedSeconds;
                     }
 
-                    // 🔥 3. SMART UPDATE TRIGGER
                     const hasMissingData = (existingJob.totalToProcess === 0 && newTotal > 0);
                     const hasCountMismatch = existingJob.processedCount !== newProcessed || existingJob.totalToProcess !== newTotal;
                     const hasStateMismatch = existingJob.isProcessing !== backendIsProcessing || existingJob.isPaused !== backendIsPaused;
                     const hasTimeMismatch = Math.abs((existingJob.processingTime || 0) - currentProcessingTime) > 5;
 
                     if (hasCountMismatch || hasStateMismatch || hasMissingData || hasTimeMismatch) {
-                        next[profileName] = { 
-                            ...existingJob, 
-                            isProcessing: backendIsProcessing, 
-                            isPaused: backendIsPaused, 
-                            _isQueued: backendIsQueued, 
-                            isComplete: isDone, 
-                            totalToProcess: newTotal, 
-                            processedCount: newProcessed, 
-                            successCount: newSuccess, 
-                            errorCount: newError, 
-                            results: mergedResults,
-                            formData: restoredFormData,             // RESTORES UI INPUTS
-                            processingTime: currentProcessingTime,  // RESTORES TIMER
-                            processingStartTime: startTime ? new Date(startTime) : existingJob.processingStartTime
-                        } as any;
+                        next[profileName] = { ...existingJob, isProcessing: backendIsProcessing, isPaused: backendIsPaused, _isQueued: backendIsQueued, isComplete: isDone, totalToProcess: newTotal, processedCount: newProcessed, successCount: newSuccess, errorCount: newError, results: mergedResults, formData: restoredFormData, processingTime: currentProcessingTime, processingStartTime: startTime ? new Date(startTime) : existingJob.processingStartTime } as any;
                         hasChanges = true;
                     }
                 });
@@ -409,11 +319,30 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         const handleJobStarted = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: true, _isQueued: false, _forceStopped: false, isPaused: false } as any })); };
         const handleBulkComplete = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: false, isComplete: true } as any })); };
         const handleBulkEnded = (data: any) => { if (data.jobType?.startsWith('Flow_')) setJobs(prev => ({ ...prev, [data.profileName]: { ...getSafeJob(prev, data.profileName), isProcessing: false, _forceStopped: true } as any })); };
-        const handleJobCleared = (data: any) => { if (data.jobType?.startsWith('Flow_')) { setJobs(prev => { const safeJob = getSafeJob(prev, data.profileName); return { ...prev, [data.profileName]: { ...safeJob, results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, processedCount: 0, successCount: 0, errorCount: 0, _forceStopped: true, _isQueued: false, formData: { ...safeJob.formData, bulkData: '' } } as any }; }); } };
+        
+        const handleJobCleared = (data: any) => { 
+            if (data.jobType?.startsWith('Flow_')) { 
+                setJobs(prev => { 
+                    const safeJob = getSafeJob(prev, data.profileName); 
+                    return { ...prev, [data.profileName]: { ...safeJob, results: [], totalToProcess: 0, isProcessing: false, isPaused: false, isComplete: false, processedCount: 0, successCount: 0, errorCount: 0, _forceStopped: true, _isQueued: false, formData: { ...safeJob.formData, bulkData: '' } } as any }; 
+                }); 
+
+                if (isSequentialRef.current) {
+                    if (sequentialQueueRef.current.length > 0) {
+                        const nextTarget = sequentialQueueRef.current.shift();
+                        setWipeModalState(prev => ({ ...prev, target: `ACCOUNTS REMAINING (${sequentialQueueRef.current.length + 1})` }));
+                        setTimeout(() => { socket.emit('clearJob', { profileName: nextTarget, jobType: `Flow_${nextTarget}` }); }, 1000);
+                    } else {
+                        isSequentialRef.current = false; setMasterWipeActive(false);
+                    }
+                }
+            } 
+        };
         
         socket.on('databaseSync', handleSync); socket.on('jobStarted', handleJobStarted); socket.on('bulkComplete', handleBulkComplete); socket.on('bulkEnded', handleBulkEnded); socket.on('jobCleared', handleJobCleared); socket.on('flowResult', handleBufferedResult); 
         socket.emit('requestDatabaseSync'); const heartbeat = setInterval(() => { socket.emit('requestDatabaseSync'); }, 2500);
-        return () => { clearInterval(heartbeat); socket.off('databaseSync', handleSync); socket.off('jobStarted', handleJobStarted); socket.off('bulkComplete', handleBulkComplete); socket.off('bulkEnded', handleBulkEnded); socket.off('jobCleared', handleJobCleared); socket.off('flowResult', handleBufferedResult); };
+        
+        return () => { clearInterval(heartbeat); socket.off('databaseSync', handleSync); socket.off('jobStarted', handleJobStarted); socket.off('bulkComplete', handleBulkComplete); socket.off('bulkEnded', handleBulkEnded); socket.off('jobCleared', handleJobCleared); socket.off('flowResult', handleBufferedResult); socket.off('heavy-job-update', handleHeavyUpdate); };
     }, [socket, setJobs, createInitialJobState]); 
 
     useEffect(() => {
@@ -438,18 +367,136 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), formData: { ...getSafeJob(prev, activeProfileName).formData, ...updates } } })); 
     };
 
-    const handleClearJob = () => { if (!activeProfileName || !socket) return; if (window.confirm(`⚠️ Are you sure you want to completely WIPE all data for ${activeProfileName}?`)) { socket.emit('clearJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); } };
-    const handleClearAllJobs = () => { if (!socket) return; if (window.confirm(`🚨 DANGER: Are you sure you want to completely WIPE ALL databases for EVERY profile on Flow?`)) { flowProfiles.forEach(p => socket.emit('clearJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` })); setJobs({}); toast({ title: "Master Wipe Initiated", description: "All Flow accounts are being cleared." }); } };
+    const triggerWipeSingle = () => {
+        if (!activeProfileName || !socket) return;
+        socket.emit('endJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` });
+        setWipeModalState({ isOpen: true, type: 'single', target: activeProfileName });
+        setTimeout(() => { socket.emit('clearJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); }, 500); 
+    };
+
+    const triggerWipeAll = () => {
+        if (!socket || flowProfiles.length === 0) return;
+        socket.emit('endAllFlowJobs');
+        const allNames = flowProfiles.map(p => p.profileName);
+        sequentialQueueRef.current = [...allNames];
+        isSequentialRef.current = true;
+        setMasterWipeActive(true);
+        setWipeModalState({ isOpen: true, type: 'all', target: `ACCOUNTS REMAINING (${allNames.length})` });
+        const first = sequentialQueueRef.current.shift();
+        if (first) { setTimeout(() => { socket.emit('clearJob', { profileName: first, jobType: `Flow_${first}` }); }, 1000); }
+    };
+
+    // 🚀 THE FIX: Restored the clean, fast Master Blast Logic!
+    const handleMasterBatchStart = () => {
+        const idleProfiles = flowProfiles.filter(p => !jobs[p.profileName]?.isProcessing && !(jobs[p.profileName] as any)?._isQueued && !jobs[p.profileName]?.isPaused);
+        if (idleProfiles.length === 0) return toast({ title: "All Active", description: "Accounts are already running.", variant: "default" });
+
+        const payloads: any[] = [];
+        idleProfiles.forEach(profileData => {
+            const pName = profileData.profileName; const job = jobs[pName]; const url = profileData.flow?.webhookUrl;
+            let safeStatic = {}; let safeBulk = '';
+            
+            if (pName === activeProfileName) { 
+                safeStatic = formData.staticData; safeBulk = formData.bulkData; 
+            } else if (typeof job?.formData?.bulkData === 'string' && job.formData.bulkData.trim().length > 0) { 
+                safeStatic = job.formData.staticData || {}; safeBulk = job.formData.bulkData; 
+            } else return;
+            
+            if (!url || !safeBulk.trim()) return;
+            const accIndex = flowProfiles.findIndex(p => p.profileName === pName) + 1;
+            
+            // 🚀 FORCE MEMORY SAFETY FOR MASSIVE JOBS automatically
+            const rowCount = safeBulk.split('\n').filter((x: string) => x.trim()).length;
+            const autoHeavy = rowCount > 5000 ? true : ((job?.formData as any)?.isHeavyJob || false);
+
+            payloads.push({ 
+                selectedProfileName: pName, webhookUrl: url, bulkField: 'email', bulkData: safeBulk, 
+                staticData: safeStatic, delay: formData.delay || 0, concurrency: formData.concurrency || 1, 
+                stopAfterFailures: (job?.formData as any)?.stopAfterFailures || 0, 
+                appendAccountName: (job?.formData as any)?.appendAccountName || false, accountIndex: accIndex, 
+                activeProfile: profileData, trackingEnabled: (job?.formData as any)?.trackingEnabled || false, 
+                targetHtmlField: (job?.formData as any)?.targetHtmlField || 'description', startingRowNumber: 1, 
+                useStrictCallback: (job?.formData as any)?.useStrictCallback || false, workerUrl: profileData.flow?.workerUrl || '', 
+                isHeavyJob: autoHeavy // Passes the safety net
+            });
+        });
+        
+        if (payloads.length === 0) return toast({ title: "No Data", description: "No accounts have data to process.", variant: "destructive" });
+
+        // Instantly mark them all as Queued in the UI so the button locks correctly
+        setJobs(prev => {
+            const next = { ...prev };
+            payloads.forEach(p => {
+                next[p.selectedProfileName] = { 
+                    ...getSafeJob(next, p.selectedProfileName), 
+                    isProcessing: false, isPaused: false, _isQueued: true, _forceStopped: false, 
+                    results: [], totalToProcess: p.bulkData.split('\n').filter((x: string) => x.trim()).length, 
+                    processedCount: 0, successCount: 0, errorCount: 0 
+                } as any;
+            });
+            return next;
+        });
+
+        // Fire directly to the backend - the backend controls the pacing now
+        socket?.emit('startMasterBatchFlowJob', { concurrency: masterBatchConcurrency, payloads });
+        toast({ title: "Master Batch Started", description: "Accounts successfully injected to queue." });
+    };
+
+    const handleMasterPauseAll = () => {
+        socket?.emit('pauseAllFlowJobs');
+        setJobs(prev => {
+            const next = { ...prev };
+            flowProfiles.forEach(p => {
+                const job = next[p.profileName];
+                if (job && ((job.isProcessing && !job.isPaused) || (job as any)?._isQueued)) {
+                    const wasQueued = !!(job as any)._isQueued;
+                    next[p.profileName] = { ...getSafeJob(next, p.profileName), isPaused: true, isProcessing: !wasQueued, _isQueued: wasQueued, _forcePaused: true } as any;
+                }
+            });
+            return next;
+        });
+        toast({ title: "Master Batch Paused", description: "All active accounts paused." });
+    };
+
+    const handleMasterForceResume = () => {
+        socket?.emit('resumeAllFlowJobs');
+        setJobs(prev => {
+            const next = { ...prev };
+            flowProfiles.forEach(p => {
+                const job = next[p.profileName];
+                if (job && (job.isPaused || (job as any)?._forcePaused)) {
+                    const isQueued = !!(job as any)._isQueued;
+                    next[p.profileName] = { ...getSafeJob(next, p.profileName), isPaused: false, isProcessing: !isQueued, _isQueued: isQueued, _forcePaused: false } as any;
+                }
+            });
+            return next;
+        });
+        toast({ title: "Master Batch Resumed", description: "All paused accounts resumed." });
+    };
+
+    const handleMasterStopAll = () => { 
+        socket?.emit('endAllFlowJobs');
+        setJobs(prev => {
+            const next = { ...prev };
+            flowProfiles.forEach(p => {
+                const job = next[p.profileName];
+                if (job && (job.isProcessing || (job as any)?._isQueued || job.isPaused)) {
+                    next[p.profileName] = { ...getSafeJob(next, p.profileName), isProcessing: false, isPaused: false, _isQueued: false, _forceStopped: true } as any;
+                }
+            });
+            return next;
+        });
+        toast({ title: "Master Batch Stopped", description: "All accounts successfully ended.", variant: "destructive" }); 
+    };
 
     const jobState = getSafeJob(jobs as any, activeProfileName || '');
     const { formData, results } = jobState;
     const webhookUrl = selectedProfile?.flow?.webhookUrl || '';
     const trackingEnabled = (formData as any).trackingEnabled || false;
     const targetHtmlField = (formData as any).targetHtmlField || 'description';
-    
-    // Strict Mode variables
     const savedWorkerUrl = selectedProfile?.flow?.workerUrl || '';
     const useStrictCallback = (formData as any).useStrictCallback || false;
+    const isHeavyJob = formData.isHeavyJob || false; 
 
     const eligibleProfilesCount = useMemo(() => flowProfiles.length, [flowProfiles]);
     const recordCount = useMemo(() => { if (!formData.bulkData) return 0; return formData.bulkData.split('\n').filter(line => line.trim() !== '').length; }, [formData.bulkData]);
@@ -459,12 +506,17 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         
         let rows: any[] = []; try { rows = JSON.parse(formData.bulkData); } catch (e) { rows = formData.bulkData.split('\n').filter(x => x.trim()).map(val => ({ email: val.trim() })); }
         setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isProcessing: true, isPaused: false, isComplete: false, _forceStopped: false, _isQueued: false, _ignition: false, totalToProcess: rows.length, results: [], processedCount: 0, successCount: 0, errorCount: 0 } as any }));
+        
         socket?.emit('startBulkFlowJob', { 
             selectedProfileName: activeProfileName, webhookUrl, bulkField: 'email', bulkData: formData.bulkData, staticData: formData.staticData, 
             delay: formData.delay, concurrency: formData.concurrency, stopAfterFailures: (formData as any).stopAfterFailures || 0, 
             appendAccountName: (formData as any).appendAccountName || false, accountIndex: activeAccIndex, trackingEnabled, targetHtmlField, startingRowNumber: 1,
-            useStrictCallback, workerUrl: savedWorkerUrl
+            useStrictCallback, workerUrl: savedWorkerUrl, isHeavyJob 
         });
+
+        if (isHeavyJob) {
+            toast({ title: "Heavy Job Initiated", description: "Memory Protection Active. Table rendering disabled." });
+        }
     };
 
     const handleApplyAllFlow = () => {
@@ -474,30 +526,8 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
             flowProfiles.forEach(p => { 
                 const targetAccIndex = flowProfiles.findIndex(fp => fp.profileName === p.profileName) + 1;
                 let desc = formData.staticData?.description || '';
-                
-                if ((formData as any).appendAccountName) {
-                    desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                    desc = desc + BR_STRING + targetAccIndex;
-                } else {
-                    desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                }
-
-                next[p.profileName] = { 
-                    ...getSafeJob(next, p.profileName), 
-                    formData: { 
-                        ...getSafeJob(next, p.profileName).formData, 
-                        bulkField: 'email', 
-                        bulkData: formData.bulkData, 
-                        staticData: { ...formData.staticData, description: desc }, 
-                        delay: formData.delay, 
-                        concurrency: formData.concurrency,
-                        stopAfterFailures: (formData as any).stopAfterFailures || 0,
-                        appendAccountName: (formData as any).appendAccountName || false,
-                        trackingEnabled, 
-                        targetHtmlField,
-                        useStrictCallback
-                    } as any 
-                }; 
+                if ((formData as any).appendAccountName) { desc = desc.replace(/(<br>){5,}\d*$/g, ''); desc = desc + BR_STRING + targetAccIndex; } else { desc = desc.replace(/(<br>){5,}\d*$/g, ''); }
+                next[p.profileName] = { ...getSafeJob(next, p.profileName), formData: { ...getSafeJob(next, p.profileName).formData, bulkField: 'email', bulkData: formData.bulkData, staticData: { ...formData.staticData, description: desc }, delay: formData.delay, concurrency: formData.concurrency, stopAfterFailures: (formData as any).stopAfterFailures || 0, appendAccountName: (formData as any).appendAccountName || false, trackingEnabled, targetHtmlField, useStrictCallback, isHeavyJob } as any }; 
             }); 
             return next; 
         });
@@ -508,39 +538,17 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         setJobs(prev => {
             const next = { ...prev };
             selectedProfiles.forEach(pName => {
-                const existingJob = getSafeJob(next, pName);
-                let updatedFormData = { ...existingJob.formData } as any;
+                const existingJob = getSafeJob(next, pName); let updatedFormData = { ...existingJob.formData } as any;
                 const targetAccIndex = flowProfiles.findIndex(p => p.profileName === pName) + 1;
-
-                if (applyOptions.iterator) {
-                    updatedFormData.bulkField = 'email'; 
-                    updatedFormData.bulkData = modalFormData.bulkData;
-                }
-                if (applyOptions.staticFields) {
-                    updatedFormData.staticData = { ...modalFormData.staticData };
-                }
-                if (applyOptions.execution) {
-                    updatedFormData.delay = modalFormData.delay;
-                    updatedFormData.concurrency = modalFormData.concurrency;
-                    updatedFormData.stopAfterFailures = modalFormData.stopAfterFailures; 
-                }
-                if (applyOptions.tracking) {
-                    updatedFormData.trackingEnabled = modalTrackingData.trackingEnabled;
-                    updatedFormData.targetHtmlField = modalTrackingData.targetHtmlField;
-                    updatedFormData.appendAccountName = modalTrackingData.appendAccountName; 
-                }
-
+                if (applyOptions.iterator) { updatedFormData.bulkField = 'email'; updatedFormData.bulkData = modalFormData.bulkData; }
+                if (applyOptions.staticFields) { updatedFormData.staticData = { ...modalFormData.staticData }; }
+                if (applyOptions.execution) { updatedFormData.delay = modalFormData.delay; updatedFormData.concurrency = modalFormData.concurrency; updatedFormData.stopAfterFailures = modalFormData.stopAfterFailures; }
+                if (applyOptions.tracking) { updatedFormData.trackingEnabled = modalTrackingData.trackingEnabled; updatedFormData.targetHtmlField = modalTrackingData.targetHtmlField; updatedFormData.appendAccountName = modalTrackingData.appendAccountName; }
                 if (applyOptions.staticFields || applyOptions.tracking) {
                     let desc = updatedFormData.staticData?.description || '';
-                    if (updatedFormData.appendAccountName) {
-                        desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                        desc = desc + BR_STRING + targetAccIndex;
-                    } else if (applyOptions.tracking) {
-                        desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                    }
+                    if (updatedFormData.appendAccountName) { desc = desc.replace(/(<br>){5,}\d*$/g, ''); desc = desc + BR_STRING + targetAccIndex; } else if (applyOptions.tracking) { desc = desc.replace(/(<br>){5,}\d*$/g, ''); }
                     updatedFormData.staticData = { ...updatedFormData.staticData, description: desc };
                 }
-
                 next[pName] = { ...existingJob, formData: updatedFormData };
             });
             return next;
@@ -548,89 +556,9 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
         toast({ title: "Settings Applied", description: `Applied to ${selectedProfiles.length} accounts successfully.` });
     };
 
-    const handlePauseResume = () => {
-        if (!socket || !activeProfileName) return; const isPaused = jobState.isPaused; socket.emit(isPaused ? 'resumeJob' : 'pauseJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isPaused: !isPaused, isProcessing: true } as any })); toast({ title: isPaused ? "Job Resumed!" : "Job Paused." }); 
-    };
+    const handlePauseResume = () => { if (!socket || !activeProfileName) return; const isPaused = jobState.isPaused; socket.emit(isPaused ? 'resumeJob' : 'pauseJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isPaused: !isPaused, isProcessing: true } as any })); toast({ title: isPaused ? "Job Resumed!" : "Job Paused." }); };
 
-    const activeMasterJobs = useMemo(() => {
-        let running = 0; let paused = 0; let queued = 0;
-        flowProfiles.forEach(p => { const job = jobs[p.profileName]; if (job && job.isProcessing) { if (job.isPaused) paused++; else running++; } else if ((job as any)?._isQueued) queued++; });
-        return { running, paused, queued, totalProcessing: running + paused + queued };
-    }, [jobs, flowProfiles]);
-
-    const handleMasterBatchStart = () => {
-        const idleProfiles = flowProfiles.filter(p => !jobs[p.profileName]?.isProcessing && !(jobs[p.profileName] as any)?._isQueued);
-        if (idleProfiles.length === 0) return toast({ title: "All Active", description: "Accounts are already running.", variant: "default" });
-        const payloads: any[] = [];
-        idleProfiles.forEach(profileData => {
-            const pName = profileData.profileName; const job = jobs[pName]; const url = profileData.flow?.webhookUrl;
-            let safeStatic = {}; let safeBulk = '';
-            if (pName === activeProfileName) { safeStatic = formData.staticData; safeBulk = formData.bulkData; } 
-            else if (typeof job?.formData?.bulkData === 'string' && job.formData.bulkData.trim().length > 0) { safeStatic = job.formData.staticData || {}; safeBulk = job.formData.bulkData; } 
-            else return;
-            if (!url || !safeBulk.trim()) return;
-            
-            const accIndex = flowProfiles.findIndex(p => p.profileName === pName) + 1;
-            
-            payloads.push({ 
-                selectedProfileName: pName, webhookUrl: url, bulkField: 'email', bulkData: safeBulk, staticData: safeStatic, 
-                delay: formData.delay || 0, concurrency: formData.concurrency || 1, stopAfterFailures: (job?.formData as any)?.stopAfterFailures || 0, 
-                appendAccountName: (job?.formData as any)?.appendAccountName || false, accountIndex: accIndex, activeProfile: profileData, 
-                trackingEnabled: (job?.formData as any)?.trackingEnabled || false, targetHtmlField: (job?.formData as any)?.targetHtmlField || 'description', startingRowNumber: 1,
-                useStrictCallback: (job?.formData as any)?.useStrictCallback || false, workerUrl: profileData.flow?.workerUrl || ''
-            });
-        });
-        if (payloads.length === 0) return toast({ title: "No Data", description: "No accounts have data to process.", variant: "destructive" });
-        setJobs(prev => { const next = { ...prev }; payloads.forEach(p => { next[p.selectedProfileName] = { ...getSafeJob(next, p.selectedProfileName), isProcessing: false, isPaused: false, _isQueued: true, results: [], totalToProcess: p.bulkData.split('\n').filter((x: string) => x.trim()).length, processedCount: 0, successCount: 0, errorCount: 0 } as any; }); return next; });
-        socket?.emit('startMasterBatchFlowJob', { concurrency: masterBatchConcurrency, payloads }); toast({ title: "Master Batch Started" });
-    };
-
-    const handleMasterPauseAll = () => {
-        let pausedCount = 0;
-        flowProfiles.forEach(p => {
-            const job = jobs[p.profileName];
-            // Targets jobs that are either running OR queued
-            if (job && ((job.isProcessing && !job.isPaused) || (job as any)?._isQueued)) {
-                setJobs(prev => {
-                    const existing = getSafeJob(prev, p.profileName);
-                    const wasQueued = !!(existing as any)._isQueued;
-                    return { ...prev, [p.profileName]: { ...existing, isPaused: true, isProcessing: !wasQueued, _isQueued: wasQueued, _forcePaused: true } as any };
-                });
-                socket?.emit('pauseJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` });
-                pausedCount++;
-            }
-        });
-        toast({ title: "Master Batch Paused", description: `Paused ${pausedCount} accounts.` });
-    };
-
-    const handleMasterForceResume = () => {
-        let resumedCount = 0;
-        flowProfiles.forEach(p => {
-            const job = jobs[p.profileName];
-            if (job && (job.isPaused || (job as any)?._forcePaused)) {
-                setJobs(prev => {
-                    const existing = getSafeJob(prev, p.profileName);
-                    const isQueued = !!(existing as any)._isQueued;
-                    return { ...prev, [p.profileName]: { ...existing, isPaused: false, isProcessing: !isQueued, _isQueued: isQueued, _forcePaused: false } as any };
-                });
-                socket?.emit('resumeJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` });
-                resumedCount++;
-            }
-        });
-        toast({ title: "Master Batch Resumed", description: `Resumed ${resumedCount} accounts.` });
-    };
-
-    const handleMasterStopAll = () => { 
-        flowProfiles.forEach(p => { 
-            const job = jobs[p.profileName]; 
-            if (job && (job.isProcessing || (job as any)?._isQueued || job.isPaused)) { 
-                socket?.emit('endJob', { profileName: p.profileName, jobType: `Flow_${p.profileName}` }); 
-                setJobs(prev => ({ ...prev, [p.profileName]: { ...getSafeJob(prev, p.profileName), isProcessing: false, _forceStopped: true } as any })); 
-            } 
-        }); 
-        toast({ title: "Master Batch Stopped", variant: "destructive" }); 
-    };
-
+    const activeMasterJobs = useMemo(() => { let running = 0; let paused = 0; let queued = 0; flowProfiles.forEach(p => { const job = jobs[p.profileName]; if (job && job.isProcessing) { if (job.isPaused) paused++; else running++; } else if ((job as any)?._isQueued) queued++; }); return { running, paused, queued, totalProcessing: running + paused + queued }; }, [jobs, flowProfiles]);
     const handleRetryFailed = () => { if (!activeProfileName) return; const failed = results.filter(r => !r.success && r.stage === 'complete').map(r => r.identifier).join('\n'); if (!failed) return toast({ title: "No failed items" }); updateFormData({ bulkData: failed }); setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isProcessing: false, totalToProcess: failed.split('\n').length, results: [], processedCount: 0, successCount: 0, errorCount: 0 } as any })); toast({ title: "Ready for Retry" }); };
 
     const completedCount = (jobState as any).processedCount || 0; const successCount = (jobState as any).successCount || 0; const errorCount = (jobState as any).errorCount || 0;
@@ -638,10 +566,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
 
     const filteredResults = useMemo(() => {
         let res = [...results].sort((a, b) => { const numA = a.rowNumber || a.fallbackRowNumber || 0; const numB = b.rowNumber || b.fallbackRowNumber || 0; return numB - numA; });
-        if (statusFilter === 'success') res = res.filter(r => r.success && r.stage === 'complete'); 
-        else if (statusFilter === 'error') res = res.filter(r => !r.success && r.stage === 'complete');
-        else if (statusFilter === 'waiting') res = res.filter(r => r.stage === 'waiting');
-        
+        if (statusFilter === 'success') res = res.filter(r => r.success && r.stage === 'complete'); else if (statusFilter === 'error') res = res.filter(r => !r.success && r.stage === 'complete'); else if (statusFilter === 'waiting') res = res.filter(r => r.stage === 'waiting');
         if (filterText) { const l = filterText.toLowerCase(); res = res.filter(r => r.identifier.toLowerCase().includes(l) || (r.details || '').toLowerCase().includes(l) ); }
         return res;
     }, [results, filterText, statusFilter]);
@@ -665,8 +590,8 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                                     <div className="flex items-center justify-between w-full gap-4 flex-wrap">
                                         <span className="flex items-center gap-2">Target Account: <span className="font-bold text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded border border-yellow-200">{activeProfileName}</span></span>
                                         <div className="flex items-center gap-2">
-                                            <Button variant="outline" size="sm" className="h-7 text-xs border-red-200 text-red-600 hover:bg-red-50" onClick={handleClearJob}><Trash2 className="h-3 w-3 mr-1.5" /> Wipe Account</Button>
-                                            <Button variant="destructive" size="sm" className="h-7 text-xs font-bold bg-red-600 hover:bg-red-700" onClick={handleClearAllJobs}><AlertTriangle className="h-3 w-3 mr-1.5" /> Wipe ALL</Button>
+                                            <Button variant="outline" size="sm" className="h-7 text-xs border-red-200 text-red-600 hover:bg-red-50" onClick={triggerWipeSingle}><Trash2 className="h-3 w-3 mr-1.5" /> Wipe Account</Button>
+                                            <Button variant="destructive" size="sm" className="h-7 text-xs font-bold bg-red-600 hover:bg-red-700" onClick={triggerWipeAll}><AlertTriangle className="h-3 w-3 mr-1.5" /> Wipe ALL</Button>
                                             <div className="w-px h-4 bg-border mx-1 hidden sm:block"></div>
                                             <Button variant="outline" size="sm" className="h-7 text-xs bg-blue-50 text-blue-600 border-blue-200 hover:bg-blue-100" onClick={() => setIsApplyAllModalOpen(true)} disabled={jobState.isProcessing || (jobState as any)._isQueued}><CopyCheck className="h-3 w-3 mr-1.5" /> Apply Config to All</Button>
                                         </div>
@@ -691,7 +616,10 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                                                 {(jobState.isProcessing || (jobState as any)._isQueued) && (
                                                     <>
                                                         <Button size="sm" className={cn("flex-1 font-bold transition-colors", jobState.isPaused ? "bg-green-600 hover:bg-green-700 text-white shadow-[0_0_15px_rgba(22,163,74,0.4)]" : "")} variant={jobState.isPaused ? "default" : "outline"} onClick={handlePauseResume} disabled={(jobState as any)._isQueued}>{jobState.isPaused ? <Play className="mr-1 h-3 w-3" /> : <Pause className="mr-1 h-3 w-3" />}{jobState.isPaused ? "Resume" : "Pause"}</Button>
-                                                        <Button size="sm" variant="destructive" className="flex-1" onClick={() => { socket?.emit('endJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isProcessing: false, _forceStopped: true } as any })); }}><Square className="mr-1 h-3 w-3" /> Stop</Button>
+                                                        <Button size="sm" variant="destructive" className="flex-1" onClick={() => { 
+                                                            socket?.emit('endJob', { profileName: activeProfileName, jobType: `Flow_${activeProfileName}` }); 
+                                                            setJobs(prev => ({ ...prev, [activeProfileName]: { ...getSafeJob(prev, activeProfileName), isProcessing: false, isPaused: false, _isQueued: false, _forceStopped: true } as any })); 
+                                                        }}><Square className="mr-1 h-3 w-3" /> Stop</Button>
                                                     </>
                                                 )}
                                             </div>
@@ -709,38 +637,18 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                                             {trackingEnabled && (<div className="pl-6"><Input placeholder="JSON Key for HTML Body injection (e.g., description)" value={targetHtmlField} onChange={(e) => updateFormData({ targetHtmlField: e.target.value })} className="h-8 text-xs font-mono" disabled={jobState.isProcessing || (jobState as any)._isQueued} /></div>)}
                                             
                                             <div className="flex items-center space-x-2 pt-2 border-t mt-2">
-                                                <Checkbox 
-                                                    id="appendAccountName" 
-                                                    checked={(formData as any).appendAccountName || false} 
-                                                    onCheckedChange={(c) => {
-                                                        let desc = formData.staticData?.description || '';
-                                                        if (c) {
-                                                            desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                                                            desc = desc + BR_STRING + activeAccIndex;
-                                                        } else {
-                                                            desc = desc.replace(/(<br>){5,}\d*$/g, '');
-                                                        }
-                                                        updateFormData({ 
-                                                            appendAccountName: !!c,
-                                                            staticData: { ...formData.staticData, description: desc }
-                                                        });
-                                                    }} 
-                                                    disabled={jobState.isProcessing || (jobState as any)._isQueued} 
-                                                />
+                                                <Checkbox id="appendAccountName" checked={(formData as any).appendAccountName || false} onCheckedChange={(c) => { let desc = formData.staticData?.description || ''; if (c) { desc = desc.replace(/(<br>){5,}\d*$/g, ''); desc = desc + BR_STRING + activeAccIndex; } else { desc = desc.replace(/(<br>){5,}\d*$/g, ''); } updateFormData({ appendAccountName: !!c, staticData: { ...formData.staticData, description: desc } }); }} disabled={jobState.isProcessing || (jobState as any)._isQueued} />
                                                 <Label htmlFor="appendAccountName" className="font-medium cursor-pointer text-muted-foreground text-sm">Append Account Index to Description</Label>
                                             </div>
 
                                             <div className="flex items-center space-x-2 pt-2 border-t mt-2 bg-amber-50/50 p-2 rounded-md border border-amber-100">
-                                                <Checkbox 
-                                                    id="useStrictCallback" 
-                                                    checked={useStrictCallback} 
-                                                    onCheckedChange={(c) => updateFormData({ useStrictCallback: !!c })} 
-                                                    disabled={jobState.isProcessing || (jobState as any)._isQueued || !savedWorkerUrl} 
-                                                    className="data-[state=checked]:bg-amber-500 data-[state=checked]:text-white border-amber-300"
-                                                />
-                                                <Label htmlFor="useStrictCallback" className="font-medium cursor-pointer text-amber-800 text-sm">
-                                                    Enable Strict Cloudflare Polling (Waiting Room) {!savedWorkerUrl && <span className="text-[10px] text-destructive font-bold ml-1">(Worker URL missing in Profile)</span>}
-                                                </Label>
+                                                <Checkbox id="useStrictCallback" checked={useStrictCallback} onCheckedChange={(c) => updateFormData({ useStrictCallback: !!c })} disabled={jobState.isProcessing || (jobState as any)._isQueued || !savedWorkerUrl} className="data-[state=checked]:bg-amber-500 data-[state=checked]:text-white border-amber-300" />
+                                                <Label htmlFor="useStrictCallback" className="font-medium cursor-pointer text-amber-800 text-sm">Enable Strict Cloudflare Polling (Waiting Room) {!savedWorkerUrl && <span className="text-[10px] text-destructive font-bold ml-1">(Worker URL missing in Profile)</span>}</Label>
+                                            </div>
+
+                                            <div className="flex items-center space-x-2 pt-2 border-t mt-2 bg-rose-50/50 p-2 rounded-md border border-rose-100">
+                                                <Checkbox id="isHeavyJob" checked={isHeavyJob} onCheckedChange={(c) => updateFormData({ isHeavyJob: !!c })} disabled={jobState.isProcessing || (jobState as any)._isQueued} className="data-[state=checked]:bg-rose-500 data-[state=checked]:text-white border-rose-300" />
+                                                <Label htmlFor="isHeavyJob" className="font-medium cursor-pointer text-rose-800 text-sm flex items-center"><Database className="h-3 w-3 mr-2" />Run as Heavy Job (&gt;10k items) - Memory Safe Mode</Label>
                                             </div>
                                         </div>
                                         <div className="pt-4 border-t grid grid-cols-3 gap-4">
@@ -750,7 +658,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                                         </div>
 
                                         <div className="grid grid-cols-4 gap-2 pt-2 text-center">
-                                            <div className="bg-muted/30 p-2 rounded"><div className="text-xl font-bold font-mono">{formatTime(jobState.processingTime)}</div><div className="text-[10px] text-muted-foreground uppercase">Elapsed</div></div>
+                                            <div className="bg-muted/30 p-2 rounded"><div className="text-xl font-bold font-mono">{formatHHMMSS(jobState.processingTime)}</div><div className="text-[10px] text-muted-foreground uppercase">Elapsed</div></div>
                                             <div className="bg-muted/30 p-2 rounded"><div className="text-xl font-bold">{remainingCount}</div><div className="text-[10px] text-muted-foreground uppercase">Remaining</div></div>
                                             <div className="bg-green-500/10 p-2 rounded text-green-700"><div className="text-xl font-bold">{successCount}</div><div className="text-[10px] uppercase">Success</div></div>
                                             <div className="bg-red-500/10 p-2 rounded text-red-700"><div className="text-xl font-bold">{errorCount}</div><div className="text-[10px] uppercase">Failed</div></div>
@@ -764,7 +672,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                                     <div className="flex items-center justify-between"><Label className="text-xs font-bold text-muted-foreground uppercase">All Accounts ({eligibleProfilesCount})</Label><div className="flex items-center gap-2"><Label className="text-xs text-muted-foreground">Concurrent Batch:</Label><Input type="number" min={1} max={100} value={masterBatchConcurrency} onChange={(e) => setMasterBatchConcurrency(Number(e.target.value))} className="w-16 h-7 text-xs" disabled={activeMasterJobs.totalProcessing > 0} /></div></div>
                                     <div className="flex gap-2">
                                         <Button size="sm" className="flex-1 bg-yellow-500 hover:bg-yellow-600 text-white" onClick={handleMasterBatchStart} disabled={activeMasterJobs.totalProcessing > 0 || eligibleProfilesCount === 0}><Zap className="h-4 w-4 mr-2" /> Start Master Blast</Button>
-                                        <Button size="sm" variant="outline" className="flex-1" onClick={handleMasterPauseAll} disabled={activeMasterJobs.running === 0}><Pause className="h-4 w-4 mr-1" /> Pause All</Button>
+                                        <Button size="sm" variant="outline" className="flex-1" onClick={handleMasterPauseAll} disabled={activeMasterJobs.running === 0 && activeMasterJobs.queued === 0}><Pause className="h-4 w-4 mr-1" /> Pause All</Button>
                                         <Button size="sm" variant="outline" className="flex-1" onClick={handleMasterForceResume} disabled={activeMasterJobs.paused === 0}><Play className="h-4 w-4 mr-1" /> Resume All</Button>
                                         <Button size="sm" variant="destructive" className="flex-1" onClick={handleMasterStopAll} disabled={activeMasterJobs.totalProcessing === 0}><Square className="h-4 w-4 mr-1" /> End All</Button>
                                     </div>
@@ -774,7 +682,7 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                         </CardContent>
                     </Card>
 
-                    {((jobState as any)._isQueued || results.length > 0 || jobState.isProcessing) && (
+                    {!isHeavyJob && ((jobState as any)._isQueued || results.length > 0 || jobState.isProcessing) && (
                         <Card className="shadow-medium">
                             <CardHeader className="pb-4">
                                 <div className="flex items-center justify-between">
@@ -846,16 +754,15 @@ const FlowCustomModule: React.FC<FlowCustomModuleProps> = ({
                 onClose={() => setIsApplyAllModalOpen(false)} 
                 onApply={handleApplyAll} 
                 profiles={flowProfiles} 
-                initialData={{ 
-                    bulkData: formData.bulkData, 
-                    staticData: formData.staticData || {}, 
-                    delay: formData.delay || 0, 
-                    concurrency: formData.concurrency || 1, 
-                    stopAfterFailures: (formData as any).stopAfterFailures || 0, 
-                    trackingEnabled: trackingEnabled, 
-                    targetHtmlField: targetHtmlField,
-                    appendAccountName: (formData as any).appendAccountName || false
-                }} 
+                initialData={{ bulkData: formData.bulkData, staticData: formData.staticData || {}, delay: formData.delay || 0, concurrency: formData.concurrency || 1, stopAfterFailures: (formData as any).stopAfterFailures || 0, trackingEnabled: trackingEnabled, targetHtmlField: targetHtmlField, appendAccountName: (formData as any).appendAccountName || false }} 
+            />
+
+            <WipeProgressModal 
+                isOpen={wipeModalState.isOpen}
+                onClose={() => setWipeModalState({ ...wipeModalState, isOpen: false })}
+                isWiping={wipeModalState.type === 'all' ? masterWipeActive : (isWiping || false)}
+                wipeProgress={wipeProgress || ''}
+                targetName={wipeModalState.target}
             />
         </>
     );

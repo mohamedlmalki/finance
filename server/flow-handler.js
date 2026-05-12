@@ -5,7 +5,6 @@ const db = require('./postgres');
 const { cliColors } = require('./utils');
 
 const spawnQueueProcessor = async (socket, data, isMaster = false) => {
-    // 1. Handle Search and Export Requests First
     if (data.isSearchRequest) {
         if (db) { 
             const res = await db.query("SELECT * FROM job_results WHERE profileName = $1 AND jobId LIKE $2 AND (identifier ILIKE $3 OR details ILIKE $3) ORDER BY timestamp DESC LIMIT 500", [data.selectedProfileName, `Flow_${data.selectedProfileName}%`, `%${data.query}%`]); 
@@ -21,8 +20,7 @@ const spawnQueueProcessor = async (socket, data, isMaster = false) => {
         return;
     }
 
-    // 2. Setup the Job details (🚨 ADDED useStrictCallback & workerUrl)
-    let { webhookUrl, bulkData, staticData, bulkField, delay, selectedProfileName, activeProfile, trackingEnabled, targetHtmlField, startingRowNumber, stopAfterFailures, appendAccountName, accountIndex, useStrictCallback, workerUrl } = data;
+    let { webhookUrl, bulkData, staticData, bulkField, delay, selectedProfileName, activeProfile, trackingEnabled, targetHtmlField, startingRowNumber, stopAfterFailures, appendAccountName, accountIndex, useStrictCallback, workerUrl, isHeavyJob } = data;
     
     if (!isMaster) {
         console.log(`\n${cliColors.yellowBold}🧠 [FLOW BATCH]${cliColors.reset} Pushing account ${cliColors.whiteBold}${selectedProfileName}${cliColors.reset} to Redis Queue...`);
@@ -53,13 +51,12 @@ const spawnQueueProcessor = async (socket, data, isMaster = false) => {
                 data: {
                     rowData: payload, identifier, webhookUrl, selectedProfileName, delay, activeProfile, 
                     rowNumber: baseRowNumber + index, trackingEnabled, targetHtmlField, bulkField, staticData, jobId,
-                    appendAccountName, accountIndex, useStrictCallback, workerUrl // 🚨 PASSED TO WORKER
+                    appendAccountName, accountIndex, useStrictCallback, workerUrl, isHeavyJob 
                 },
                 opts: { removeOnComplete: true, removeOnFail: true }
             };
         });
 
-        // 3. Register with PostgreSQL
         const initialStatus = isMaster ? 'queued' : 'running';
 
         if (db) { 
@@ -72,20 +69,28 @@ const spawnQueueProcessor = async (socket, data, isMaster = false) => {
             }); 
         }
 
-        // 4. Wipe old queue items and load new ones
         await accountQueue.pause();
         await accountQueue.drain(true).catch(() => {});
-        try { await accountQueue.obliterate({ force: true }); } catch(e) {}
+        
+        // 🚀 REDIS SAFETY CATCH: Prevents the BUSY Memurai error from crashing Node
+        try { 
+            await accountQueue.obliterate({ force: true }); 
+        } catch(e) {
+            console.log(`[REDIS] Obliterate busy on ${queueName}, falling back to manual deletion.`);
+            const rawKeys = await connection.keys(`bull:${queueName}:*`);
+            if (rawKeys.length > 0) await connection.del(...rawKeys);
+        }
+        
         await accountQueue.resume();
         
-        // 🚀 THE FIX: Chunk the jobs into batches of 500 to prevent Redis/Node freezing
-        const BATCH_SIZE = 500;
+        // 🚀 THROTTLED CHUNKING: Protects the Lua Scripts
+        const BATCH_SIZE = 250; // Dropped to 250 to keep Redis fast
         for (let i = 0; i < jobs.length; i += BATCH_SIZE) {
             const batch = jobs.slice(i, i + BATCH_SIZE);
             await accountQueue.addBulk(batch);
             
-            // Give the Node.js event loop a 50ms breather between heavy memory inserts
-            await new Promise(resolve => setTimeout(resolve, 50)); 
+            // Give Redis a 200ms breather so it can process pub/sub and other worker scripts
+            await new Promise(resolve => setTimeout(resolve, 200)); 
         }
 
         if (!isMaster) {
@@ -110,7 +115,18 @@ const handleStartBulkFlowJob = async (socket, data) => {
     await spawnQueueProcessor(socket, data, false); 
 };
 
-// 🚨 THE FIX: Accept profileName directly to guarantee a perfect queue match
+const handleGetFailedFlowItems = async (socket, data) => {
+    const { jobId, limit, offset } = data;
+    try {
+        if (db) {
+            const results = await db.getFailedFlowItems(jobId, limit || 50, offset || 0);
+            socket.emit('failedFlowItemsResult', { jobId, items: results });
+        }
+    } catch (error) {
+        console.error("Error fetching failed items:", error);
+    }
+};
+
 const killClock = async (profileName) => {
     const queueName = `FlowQueue_${profileName}`; 
     try {
@@ -122,4 +138,4 @@ const killClock = async (profileName) => {
 };
 const setActiveJobs = () => {}; 
 
-module.exports = { setActiveJobs, handleStartBulkFlowJob, handleStartMasterBatch, killClock };
+module.exports = { setActiveJobs, handleStartBulkFlowJob, handleStartMasterBatch, killClock, handleGetFailedFlowItems };
